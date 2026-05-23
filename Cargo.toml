@@ -1,0 +1,24 @@
+[package]
+name = "microvm-runtime"
+version = "0.1.0-alpha.1"
+edition = "2024"
+rust-version = "1.91"
+description = "Firecracker microVM driver for decentralized Tangle operators — pure-Rust primitive, no service, no auth, no business logic."
+license = "Unlicense"
+repository = "https://github.com/tangle-network/microvm-runtime"
+homepage = "https://github.com/tangle-network/microvm-runtime"
+documentation = "https://docs.rs/microvm-runtime"
+readme = "README.md"
+keywords = ["firecracker", "microvm", "vmm", "tangle", "sandbox"]
+categories = ["virtualization", "os::linux-apis"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[features]
+default = []
+# Enables the in-process Firecracker driver. Requires a host running KVM and
+# a Firecracker binary reachable via PATH (or `MICROVM_FIRECRACKER_BIN`).
+firecracker = []

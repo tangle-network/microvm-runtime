@@ -17,6 +17,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 
+# `libc` is only pulled in on Linux. It exists solely so
+# `shutdown::graceful_shutdown` can call `kill(2)` directly with `SIGTERM`;
+# `std::process::Child::kill` is hard-coded to `SIGKILL` and would defeat the
+# purpose of graceful teardown. Gated by target_os so non-Linux builds (where
+# the firecracker feature is meaningless) do not pull it in.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 

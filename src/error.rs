@@ -37,4 +37,9 @@ pub enum VmRuntimeError {
     /// Metrics poller failed to open, parse, or read the FC metrics FIFO.
     #[error("metrics: {0}")]
     Metrics(String),
+
+    /// Graceful shutdown of a child process failed (signal delivery, wait, or
+    /// escalation step).
+    #[error("shutdown failed: {0}")]
+    Shutdown(String),
 }

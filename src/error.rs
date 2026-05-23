@@ -42,4 +42,9 @@ pub enum VmRuntimeError {
     /// escalation step).
     #[error("shutdown failed: {0}")]
     Shutdown(String),
+
+    /// Host egress firewall (iptables) setup or teardown failed, or input
+    /// validation rejected a rule before any iptables call was made.
+    #[error("firewall error: {0}")]
+    Firewall(String),
 }

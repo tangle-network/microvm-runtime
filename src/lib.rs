@@ -34,7 +34,9 @@ pub use firewall::{EgressRule, Firewall, FirewallConfig, VmEgressRules};
 pub use jailer::{Jailer, JailerConfig, VmJail};
 #[cfg(feature = "firecracker")]
 pub use metrics::{MetricsConfig, MetricsPoller, VmMetricsSnapshot};
-pub use model::{VmStatus, VmView};
+pub use model::{
+    NetworkInterface, RateLimiter, SnapshotRef, TokenBucket, VmSpec, VmStatus, VmView,
+};
 #[cfg(feature = "firecracker")]
 pub use network::{Ipv4Net, NetworkConfig, NetworkManager, VmNetwork};
 pub use provider::{VmProvider, VmQuery, VmRuntime};

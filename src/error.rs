@@ -26,6 +26,10 @@ pub enum VmRuntimeError {
     #[error("snapshot '{snapshot_id}' already exists for vm '{vm_id}'")]
     SnapshotAlreadyExists { vm_id: String, snapshot_id: String },
 
+    /// Attempted to restore from a snapshot that does not exist on disk.
+    #[error("snapshot '{snapshot_id}' not found for vm '{vm_id}'")]
+    SnapshotNotFound { vm_id: String, snapshot_id: String },
+
     /// Internal lock was poisoned by a panicking thread.
     #[error("provider state lock poisoned")]
     StatePoisoned,

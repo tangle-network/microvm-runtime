@@ -158,12 +158,15 @@ pub struct FirecrackerVmProvider {
     composed: Arc<Mutex<HashMap<String, ComposedAttachments>>>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct ComposedAttachments {
     network_attached: bool,
     vsock_attached: bool,
     firewall_installed: bool,
-    jail_prepared: bool,
+    /// `Some(jail)` means FC was spawned under jailer in this chroot. The
+    /// `api_socket_on_host` field of the jail is what the HTTP client connects to;
+    /// the workspace default `socket_dir/<vm_id>/api.sock` is bypassed.
+    jail: Option<crate::jailer::VmJail>,
 }
 
 impl std::fmt::Debug for FirecrackerVmProvider {
@@ -288,11 +291,19 @@ impl FirecrackerVmProvider {
     /// [`ConsoleCapture`] consumption and routing it to `/dev/null` (the historical
     /// default). The composer is responsible for the toggle; bare semantics keep
     /// stderr null so callers who don't want capture don't accidentally retain it.
+    ///
+    /// `jail` is `Some` when the caller asked the composer to wrap FC in `jailer`.
+    /// In that case the FC binary is invoked via `jailer ... -- --api-sock ...`,
+    /// landing FC under the chroot. The `socket_path` parameter MUST point at
+    /// the post-jail host view of the API socket (`<chroot>/api.sock`) — the
+    /// caller is responsible for resolving this from the [`crate::jailer::VmJail`]
+    /// returned by `compose_pre_spawn`.
     fn spawn_firecracker_for_compose(
         &self,
         vm_id: &str,
         socket_path: &Path,
         capture_stderr: bool,
+        jail: Option<&crate::jailer::VmJail>,
     ) -> VmRuntimeResult<Child> {
         let parent = socket_path.parent().ok_or_else(|| {
             VmRuntimeError::Unsupported(format!(
@@ -314,9 +325,27 @@ impl FirecrackerVmProvider {
             Stdio::null()
         };
 
-        Command::new(&self.config.binary_path)
-            .arg("--api-sock")
-            .arg(socket_path)
+        let mut command = match jail {
+            Some(j) => {
+                let jailer = self
+                    .composer
+                    .as_ref()
+                    .and_then(|c| c.jailer.clone())
+                    .ok_or_else(|| {
+                        VmRuntimeError::Jailer(format!(
+                            "spawn requested jailed mode for vm {vm_id} but no jailer is on the composer"
+                        ))
+                    })?;
+                jailer.build_command(vm_id, j, &self.config.binary_path)?
+            }
+            None => {
+                let mut c = Command::new(&self.config.binary_path);
+                c.arg("--api-sock").arg(socket_path);
+                c
+            }
+        };
+
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(stderr)
@@ -388,11 +417,26 @@ impl FirecrackerVmProvider {
             }
         }
 
-        // Jailer composition is gated on the spawn_firecracker rewrite that wires
-        // the chroot'd API socket back to the host. Tracked for the next milestone;
-        // for now the composer flag is accepted but produces no action.
-        if composer.jailer.is_some() {
-            attachments.jail_prepared = false;
+        // Jailer composition: prepare per-VM chroot with the spec-resolved kernel +
+        // rootfs (defaulting to workspace config). The returned VmJail records the
+        // post-jail api.sock path on the host so the HTTP client connects to it
+        // instead of the workspace-default `socket_dir/<vm_id>/api.sock`.
+        if let Some(jailer) = composer.jailer.as_ref() {
+            let kernel = spec
+                .kernel
+                .clone()
+                .unwrap_or_else(|| self.config.kernel_path.clone());
+            let rootfs = spec
+                .rootfs
+                .clone()
+                .unwrap_or_else(|| self.config.rootfs_path.clone());
+            let extra: Vec<PathBuf> = spec
+                .extra_drives
+                .iter()
+                .map(|d| d.path_on_host.clone())
+                .collect();
+            let jail = jailer.prepare(vm_id, &kernel, &rootfs, &extra)?;
+            attachments.jail = Some(jail);
         }
 
         Ok((spec, attachments))
@@ -423,7 +467,7 @@ impl FirecrackerVmProvider {
             let _ = network.detach(vm_id);
         }
 
-        if attachments.jail_prepared
+        if attachments.jail.is_some()
             && let Some(jailer) = composer.jailer.as_ref()
         {
             let _ = jailer.teardown(vm_id);
@@ -756,12 +800,19 @@ impl FirecrackerVmProvider {
             }
         }
 
-        // Run composer-side pre-spawn primitives (network/vsock/firewall) and
-        // augment the spec accordingly. Composer is opt-in; bare semantics
+        // Run composer-side pre-spawn primitives (network/vsock/firewall/jailer)
+        // and augment the spec accordingly. Composer is opt-in; bare semantics
         // unchanged when it's None.
         let (effective_spec, attachments) = self.compose_pre_spawn(vm_id, spec.clone())?;
 
-        let socket_path = self.api_socket_path(vm_id);
+        // When jailer is composed, the API socket lives inside the chroot;
+        // the host-side connect path is `<chroot>/<api.sock-basename>`. Otherwise
+        // it's the workspace-default `socket_dir/<vm_id>/api.sock`.
+        let socket_path = attachments
+            .jail
+            .as_ref()
+            .map(|j| j.api_socket_on_host.clone())
+            .unwrap_or_else(|| self.api_socket_path(vm_id));
         let state_dir = self.vm_state_path(vm_id);
         fs::create_dir_all(&state_dir).map_err(|e| {
             self.compose_release(vm_id, &attachments);
@@ -777,14 +828,18 @@ impl FirecrackerVmProvider {
             .map(|c| c.capture_console)
             .unwrap_or(false);
 
-        let mut child =
-            match self.spawn_firecracker_for_compose(vm_id, &socket_path, capture_stderr) {
-                Ok(c) => c,
-                Err(e) => {
-                    self.compose_release(vm_id, &attachments);
-                    return Err(e);
-                }
-            };
+        let mut child = match self.spawn_firecracker_for_compose(
+            vm_id,
+            &socket_path,
+            capture_stderr,
+            attachments.jail.as_ref(),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                self.compose_release(vm_id, &attachments);
+                return Err(e);
+            }
+        };
         let restoring = effective_spec.restore_from.is_some();
         let configure_result = (|| -> VmRuntimeResult<()> {
             self.wait_for_socket_ready(&socket_path)?;
@@ -821,7 +876,7 @@ impl FirecrackerVmProvider {
         if attachments.network_attached
             || attachments.vsock_attached
             || attachments.firewall_installed
-            || attachments.jail_prepared
+            || attachments.jail.is_some()
         {
             self.composed
                 .lock()

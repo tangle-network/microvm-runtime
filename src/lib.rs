@@ -11,7 +11,8 @@ pub mod error;
 pub mod metrics;
 pub mod model;
 pub mod provider;
-
+#[cfg(feature = "firecracker")]
+pub mod shutdown;
 #[cfg(feature = "firecracker")]
 pub mod vsock;
 
@@ -25,5 +26,7 @@ pub use error::{VmRuntimeError, VmRuntimeResult};
 pub use metrics::{MetricsConfig, MetricsPoller, VmMetricsSnapshot};
 pub use model::{VmStatus, VmView};
 pub use provider::{VmProvider, VmQuery, VmRuntime};
+#[cfg(feature = "firecracker")]
+pub use shutdown::{ShutdownConfig, ShutdownOutcome, graceful_shutdown};
 #[cfg(feature = "firecracker")]
 pub use vsock::{VmVsock, VsockConfig, VsockManager};

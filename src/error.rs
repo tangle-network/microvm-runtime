@@ -47,4 +47,8 @@ pub enum VmRuntimeError {
     /// validation rejected a rule before any iptables call was made.
     #[error("firewall error: {0}")]
     Firewall(String),
+
+    /// Jailer chroot preparation, command construction, or teardown failed.
+    #[error("jailer error: {0}")]
+    Jailer(String),
 }

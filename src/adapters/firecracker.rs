@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::{
     error::{VmRuntimeError, VmRuntimeResult},
-    model::{VmStatus, VmView},
+    model::{NetworkInterface, RateLimiter, SnapshotRef, TokenBucket, VmSpec, VmStatus, VmView},
     provider::{VmProvider, VmQuery},
 };
 
@@ -186,24 +186,31 @@ impl FirecrackerVmProvider {
             .collect()
     }
 
-    fn ensure_prereqs(&self) -> VmRuntimeResult<()> {
+    fn ensure_prereqs(&self, spec: &VmSpec) -> VmRuntimeResult<()> {
         if !self.config.binary_path.exists() {
             return Err(VmRuntimeError::Unsupported(format!(
                 "firecracker binary not found: {}",
                 self.config.binary_path.display()
             )));
         }
-        if !self.config.kernel_path.exists() {
-            return Err(VmRuntimeError::Unsupported(format!(
-                "kernel image not found: {}",
-                self.config.kernel_path.display()
-            )));
-        }
-        if !self.config.rootfs_path.exists() {
-            return Err(VmRuntimeError::Unsupported(format!(
-                "rootfs image not found: {}",
-                self.config.rootfs_path.display()
-            )));
+        // Kernel + rootfs checks are skipped when restoring — the snapshot encodes its own
+        // boot source. Cold boot validates the spec-resolved paths (overrides if set, else
+        // the workspace default).
+        if spec.restore_from.is_none() {
+            let kernel = spec.kernel.as_ref().unwrap_or(&self.config.kernel_path);
+            if !kernel.exists() {
+                return Err(VmRuntimeError::Unsupported(format!(
+                    "kernel image not found: {}",
+                    kernel.display()
+                )));
+            }
+            let rootfs = spec.rootfs.as_ref().unwrap_or(&self.config.rootfs_path);
+            if !rootfs.exists() {
+                return Err(VmRuntimeError::Unsupported(format!(
+                    "rootfs image not found: {}",
+                    rootfs.display()
+                )));
+            }
         }
         fs::create_dir_all(&self.config.socket_dir).map_err(|e| {
             VmRuntimeError::Unsupported(format!(
@@ -281,28 +288,111 @@ impl FirecrackerVmProvider {
         )))
     }
 
-    fn configure_vm(&self, socket_path: &Path) -> VmRuntimeResult<()> {
+    fn configure_vm(&self, socket_path: &Path, spec: &VmSpec) -> VmRuntimeResult<()> {
+        let vcpu_count = spec.vcpu_count.unwrap_or(self.config.vcpu_count);
+        let mem_size_mib = spec.mem_size_mib.unwrap_or(self.config.mem_size_mib);
+        let track_dirty_pages = spec.track_dirty_pages.unwrap_or(true);
         let machine = serde_json::json!({
-            "vcpu_count": self.config.vcpu_count,
-            "mem_size_mib": self.config.mem_size_mib,
+            "vcpu_count": vcpu_count,
+            "mem_size_mib": mem_size_mib,
             "smt": false,
-            "track_dirty_pages": true
+            "track_dirty_pages": track_dirty_pages
         });
         self.firecracker_request(socket_path, "PUT", "/machine-config", Some(machine))?;
 
+        let kernel_path = spec.kernel.as_ref().unwrap_or(&self.config.kernel_path);
+        let boot_args = spec.boot_args.as_deref().unwrap_or(&self.config.boot_args);
         let boot = serde_json::json!({
-            "kernel_image_path": self.config.kernel_path,
-            "boot_args": self.config.boot_args
+            "kernel_image_path": kernel_path,
+            "boot_args": boot_args
         });
         self.firecracker_request(socket_path, "PUT", "/boot-source", Some(boot))?;
 
-        let root_drive = serde_json::json!({
+        let rootfs_path = spec.rootfs.as_ref().unwrap_or(&self.config.rootfs_path);
+        let rootfs_read_only = spec
+            .rootfs_read_only
+            .unwrap_or(self.config.rootfs_read_only);
+        let mut root_drive = serde_json::json!({
             "drive_id": "rootfs",
-            "path_on_host": self.config.rootfs_path,
+            "path_on_host": rootfs_path,
             "is_root_device": true,
-            "is_read_only": self.config.rootfs_read_only
+            "is_read_only": rootfs_read_only
         });
+        if let Some(limiter) = spec.rootfs_rate_limit.as_ref() {
+            root_drive["rate_limiter"] = rate_limiter_to_json(limiter);
+        }
         self.firecracker_request(socket_path, "PUT", "/drives/rootfs", Some(root_drive))?;
+
+        for iface in &spec.network_interfaces {
+            self.put_network_interface(socket_path, iface)?;
+        }
+
+        Ok(())
+    }
+
+    fn put_network_interface(
+        &self,
+        socket_path: &Path,
+        iface: &NetworkInterface,
+    ) -> VmRuntimeResult<()> {
+        let mut body = serde_json::json!({
+            "iface_id": iface.iface_id,
+            "host_dev_name": iface.host_dev_name,
+        });
+        if let Some(mac) = &iface.guest_mac {
+            body["guest_mac"] = serde_json::Value::String(mac.clone());
+        }
+        if let Some(rx) = &iface.rx_rate_limiter {
+            body["rx_rate_limiter"] = rate_limiter_to_json(rx);
+        }
+        if let Some(tx) = &iface.tx_rate_limiter {
+            body["tx_rate_limiter"] = rate_limiter_to_json(tx);
+        }
+        let path = format!("/network-interfaces/{}", iface.iface_id);
+        self.firecracker_request(socket_path, "PUT", &path, Some(body))?;
+        Ok(())
+    }
+
+    fn load_snapshot(&self, socket_path: &Path, snapshot: &SnapshotRef) -> VmRuntimeResult<()> {
+        let source_state_dir = self.vm_state_path(&snapshot.vm_id);
+        let snap_dir = source_state_dir.join("snapshots");
+        let vmstate_path = snap_dir.join(format!("{}.vmstate", snapshot.snapshot_id));
+        let mem_path = snap_dir.join(format!("{}.mem", snapshot.snapshot_id));
+        if !vmstate_path.exists() {
+            return Err(VmRuntimeError::SnapshotNotFound {
+                vm_id: snapshot.vm_id.clone(),
+                snapshot_id: snapshot.snapshot_id.clone(),
+            });
+        }
+
+        let mut body = serde_json::json!({
+            "snapshot_path": vmstate_path,
+            "mem_backend": {
+                "backend_type": "File",
+                "backend_path": mem_path,
+            },
+            "enable_diff_snapshots": false,
+            "resume_vm": snapshot.resume_immediately,
+        });
+        if !snapshot.network_overrides.is_empty() {
+            let overrides: Vec<_> = snapshot
+                .network_overrides
+                .iter()
+                .map(|iface| {
+                    let mut entry = serde_json::json!({
+                        "iface_id": iface.iface_id,
+                        "host_dev_name": iface.host_dev_name,
+                    });
+                    if let Some(mac) = &iface.guest_mac {
+                        entry["guest_mac"] = serde_json::Value::String(mac.clone());
+                    }
+                    entry
+                })
+                .collect();
+            body["network_interfaces"] = serde_json::Value::Array(overrides);
+        }
+
+        self.firecracker_request(socket_path, "PUT", "/snapshot/load", Some(body))?;
         Ok(())
     }
 
@@ -455,24 +545,8 @@ impl FirecrackerVmProvider {
         Ok(())
     }
 
-    fn kill_process(&self, vm_id: &str) -> VmRuntimeResult<()> {
-        let child = self
-            .processes
-            .lock()
-            .map_err(|_| VmRuntimeError::StatePoisoned)?
-            .remove(vm_id);
-
-        if let Some(mut child) = child {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        Ok(())
-    }
-}
-
-impl VmProvider for FirecrackerVmProvider {
-    fn create_vm(&self, vm_id: &str) -> VmRuntimeResult<()> {
-        self.ensure_prereqs()?;
+    fn create_vm_inner(&self, vm_id: &str, spec: &VmSpec) -> VmRuntimeResult<()> {
+        self.ensure_prereqs(spec)?;
 
         {
             let state = self
@@ -494,13 +568,18 @@ impl VmProvider for FirecrackerVmProvider {
         })?;
 
         let mut child = self.spawn_firecracker(vm_id, &socket_path)?;
-        let create_result = (|| -> VmRuntimeResult<()> {
+        let restoring = spec.restore_from.is_some();
+        let configure_result = (|| -> VmRuntimeResult<()> {
             self.wait_for_socket_ready(&socket_path)?;
-            self.configure_vm(&socket_path)?;
+            if let Some(snapshot) = spec.restore_from.as_ref() {
+                self.load_snapshot(&socket_path, snapshot)?;
+            } else {
+                self.configure_vm(&socket_path, spec)?;
+            }
             Ok(())
         })();
 
-        if let Err(err) = create_result {
+        if let Err(err) = configure_result {
             let _ = child.kill();
             let _ = child.wait();
             return Err(err);
@@ -511,13 +590,22 @@ impl VmProvider for FirecrackerVmProvider {
             .map_err(|_| VmRuntimeError::StatePoisoned)?
             .insert(vm_id.to_owned(), child);
 
+        // Restored VMs honour the snapshot's `resume_vm` flag — if `resume_immediately`
+        // was set, the FC API call already transitioned the VM to Running; otherwise
+        // it stays Paused/Stopped until an explicit start_vm.
+        let initial_status = match (restoring, spec.restore_from.as_ref()) {
+            (true, Some(snap)) if snap.resume_immediately => VmStatus::Running,
+            (true, _) => VmStatus::Stopped,
+            (false, _) => VmStatus::Created,
+        };
+
         self.state
             .write()
             .map_err(|_| VmRuntimeError::StatePoisoned)?
             .insert(
                 vm_id.to_owned(),
                 VmRecord {
-                    status: VmStatus::Created,
+                    status: initial_status,
                     snapshots: Vec::new(),
                     socket_path,
                     state_dir,
@@ -525,6 +613,30 @@ impl VmProvider for FirecrackerVmProvider {
             );
 
         Ok(())
+    }
+
+    fn kill_process(&self, vm_id: &str) -> VmRuntimeResult<()> {
+        let child = self
+            .processes
+            .lock()
+            .map_err(|_| VmRuntimeError::StatePoisoned)?
+            .remove(vm_id);
+
+        if let Some(mut child) = child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Ok(())
+    }
+}
+
+impl VmProvider for FirecrackerVmProvider {
+    fn create_vm(&self, vm_id: &str) -> VmRuntimeResult<()> {
+        self.create_vm_inner(vm_id, &VmSpec::default())
+    }
+
+    fn create_vm_with_spec(&self, vm_id: &str, spec: &VmSpec) -> VmRuntimeResult<()> {
+        self.create_vm_inner(vm_id, spec)
     }
 
     fn start_vm(&self, vm_id: &str) -> VmRuntimeResult<()> {
@@ -669,5 +781,82 @@ impl VmQuery for FirecrackerVmProvider {
             .read()
             .map_err(|_| VmRuntimeError::StatePoisoned)?;
         Ok(state.get(vm_id).map(|record| record.snapshots.clone()))
+    }
+}
+
+fn rate_limiter_to_json(limiter: &RateLimiter) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    if let Some(bw) = &limiter.bandwidth {
+        obj.insert("bandwidth".into(), token_bucket_to_json(bw));
+    }
+    if let Some(ops) = &limiter.ops {
+        obj.insert("ops".into(), token_bucket_to_json(ops));
+    }
+    serde_json::Value::Object(obj)
+}
+
+fn token_bucket_to_json(bucket: &TokenBucket) -> serde_json::Value {
+    serde_json::json!({
+        "size": bucket.size,
+        "one_time_burst": bucket.one_time_burst.unwrap_or(bucket.size),
+        "refill_time": bucket.refill_time_ms,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{RateLimiter, TokenBucket};
+
+    #[test]
+    fn token_bucket_default_burst_equals_size() {
+        let json = token_bucket_to_json(&TokenBucket {
+            size: 1_048_576,
+            one_time_burst: None,
+            refill_time_ms: 1_000,
+        });
+        assert_eq!(json["size"], 1_048_576);
+        assert_eq!(json["one_time_burst"], 1_048_576);
+        assert_eq!(json["refill_time"], 1_000);
+    }
+
+    #[test]
+    fn token_bucket_explicit_burst_respected() {
+        let json = token_bucket_to_json(&TokenBucket {
+            size: 1_048_576,
+            one_time_burst: Some(2_097_152),
+            refill_time_ms: 500,
+        });
+        assert_eq!(json["one_time_burst"], 2_097_152);
+    }
+
+    #[test]
+    fn rate_limiter_serialises_both_buckets() {
+        let json = rate_limiter_to_json(&RateLimiter {
+            bandwidth: Some(TokenBucket {
+                size: 10_000,
+                one_time_burst: None,
+                refill_time_ms: 100,
+            }),
+            ops: Some(TokenBucket {
+                size: 50,
+                one_time_burst: None,
+                refill_time_ms: 100,
+            }),
+        });
+        assert!(json.get("bandwidth").is_some());
+        assert!(json.get("ops").is_some());
+        assert_eq!(json["bandwidth"]["size"], 10_000);
+        assert_eq!(json["ops"]["size"], 50);
+    }
+
+    #[test]
+    fn rate_limiter_empty_serialises_to_empty_object() {
+        let json = rate_limiter_to_json(&RateLimiter {
+            bandwidth: None,
+            ops: None,
+        });
+        assert!(json.is_object());
+        assert!(json.as_object().unwrap().is_empty());
     }
 }

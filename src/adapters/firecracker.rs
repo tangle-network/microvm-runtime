@@ -9,9 +9,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::{
+    composer::FirecrackerComposer,
+    console::{ConsoleCapture, ConsoleConfig},
     error::{VmRuntimeError, VmRuntimeResult},
-    model::{NetworkInterface, RateLimiter, SnapshotRef, TokenBucket, VmSpec, VmStatus, VmView},
+    model::{
+        DriveSpec, NetworkInterface, RateLimiter, SnapshotRef, TokenBucket, VmSpec, VmStatus,
+        VmView, VsockSpec,
+    },
     provider::{VmProvider, VmQuery},
+    shutdown::graceful_shutdown,
 };
 
 const DEFAULT_FIRECRACKER_BIN: &str = "/usr/local/bin/firecracker";
@@ -134,17 +140,37 @@ impl FirecrackerConfig {
 /// Firecracker-backed provider surface.
 ///
 /// This adapter manages real Firecracker VMM processes over unix socket API.
+///
+/// By default it does the minimum: spawn FC, configure via the spec, start. To opt into
+/// auto-composition with the lifecycle primitives (network, vsock, firewall, jailer,
+/// console capture, graceful shutdown), construct via
+/// [`Self::with_composer`] or [`Self::from_env_composed`].
 #[derive(Clone)]
 pub struct FirecrackerVmProvider {
     pub config: FirecrackerConfig,
+    composer: Option<Arc<FirecrackerComposer>>,
     state: Arc<RwLock<HashMap<String, VmRecord>>>,
     processes: Arc<Mutex<HashMap<String, Child>>>,
+    #[cfg(feature = "firecracker")]
+    consoles: Arc<Mutex<HashMap<String, ConsoleCapture>>>,
+    /// Per-VM attachments owned by the composer (TAP, vsock, firewall rules, jail).
+    /// Stored opaquely so destroy_vm can release them without re-deriving identifiers.
+    composed: Arc<Mutex<HashMap<String, ComposedAttachments>>>,
+}
+
+#[derive(Default)]
+struct ComposedAttachments {
+    network_attached: bool,
+    vsock_attached: bool,
+    firewall_installed: bool,
+    jail_prepared: bool,
 }
 
 impl std::fmt::Debug for FirecrackerVmProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FirecrackerVmProvider")
             .field("config", &self.config)
+            .field("composer", &self.composer.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -153,13 +179,30 @@ impl FirecrackerVmProvider {
     pub fn new(config: FirecrackerConfig) -> Self {
         Self {
             config,
+            composer: None,
             state: Arc::new(RwLock::new(HashMap::new())),
             processes: Arc::new(Mutex::new(HashMap::new())),
+            consoles: Arc::new(Mutex::new(HashMap::new())),
+            composed: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn from_env() -> Self {
         Self::new(FirecrackerConfig::from_env())
+    }
+
+    /// Attach a [`FirecrackerComposer`] so create / destroy automatically invoke the
+    /// configured lifecycle primitives.
+    pub fn with_composer(mut self, composer: FirecrackerComposer) -> Self {
+        self.composer = Some(Arc::new(composer));
+        self
+    }
+
+    /// Shorthand for `Self::from_env().with_composer(FirecrackerComposer::from_env())`.
+    /// Every composition primitive is toggled by `MICROVM_COMPOSE_*` env vars; absent
+    /// = enabled.
+    pub fn from_env_composed() -> Self {
+        Self::from_env().with_composer(FirecrackerComposer::from_env())
     }
 
     pub fn api_socket_path(&self, vm_id: &str) -> PathBuf {
@@ -239,7 +282,18 @@ impl FirecrackerVmProvider {
         Ok(())
     }
 
-    fn spawn_firecracker(&self, vm_id: &str, socket_path: &Path) -> VmRuntimeResult<Child> {
+    /// Spawn FC under the configured launcher.
+    ///
+    /// `capture_stderr` toggles between piping the child's stderr for
+    /// [`ConsoleCapture`] consumption and routing it to `/dev/null` (the historical
+    /// default). The composer is responsible for the toggle; bare semantics keep
+    /// stderr null so callers who don't want capture don't accidentally retain it.
+    fn spawn_firecracker_for_compose(
+        &self,
+        vm_id: &str,
+        socket_path: &Path,
+        capture_stderr: bool,
+    ) -> VmRuntimeResult<Child> {
         let parent = socket_path.parent().ok_or_else(|| {
             VmRuntimeError::Unsupported(format!(
                 "invalid api socket path for vm {vm_id}: {}",
@@ -254,12 +308,18 @@ impl FirecrackerVmProvider {
         })?;
         Self::remove_stale_socket(socket_path)?;
 
+        let stderr = if capture_stderr {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        };
+
         Command::new(&self.config.binary_path)
             .arg("--api-sock")
             .arg(socket_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(stderr)
             .spawn()
             .map_err(|e| {
                 VmRuntimeError::Unsupported(format!(
@@ -267,6 +327,107 @@ impl FirecrackerVmProvider {
                     self.config.binary_path.display()
                 ))
             })
+    }
+
+    /// Run composer-side pre-spawn primitives and augment `spec` with the resulting
+    /// fields. Returns the augmented spec plus an [`ComposedAttachments`] tracker
+    /// for cleanup on destroy.
+    fn compose_pre_spawn(
+        &self,
+        vm_id: &str,
+        mut spec: VmSpec,
+    ) -> VmRuntimeResult<(VmSpec, ComposedAttachments)> {
+        let Some(composer) = self.composer.clone() else {
+            return Ok((spec, ComposedAttachments::default()));
+        };
+
+        // Restored VMs ignore network_interfaces / vsock from the spec (the snapshot
+        // encodes them), so composing per-VM TAP / CID on restore is incorrect.
+        // The composer is a no-op when restoring; callers wanting to swap network on
+        // restore should populate `SnapshotRef::network_overrides` themselves.
+        if spec.restore_from.is_some() {
+            return Ok((spec, ComposedAttachments::default()));
+        }
+
+        let mut attachments = ComposedAttachments::default();
+
+        if let Some(network) = composer.network.as_ref() {
+            network.ensure_host()?;
+            let vm_network = network.attach(vm_id)?;
+            let guest_mac = vm_network.mac_string();
+            spec.network_interfaces.push(NetworkInterface {
+                iface_id: "eth0".into(),
+                host_dev_name: vm_network.tap_name,
+                guest_mac: Some(guest_mac),
+                rx_rate_limiter: None,
+                tx_rate_limiter: None,
+            });
+            attachments.network_attached = true;
+        }
+
+        if let Some(vsock) = composer.vsock.as_ref() {
+            let attachment = vsock.attach(vm_id)?;
+            vsock.ensure_uds_parent(&attachment.uds_path)?;
+            spec.vsock = Some(VsockSpec {
+                cid: attachment.cid,
+                uds_path: attachment.uds_path,
+            });
+            attachments.vsock_attached = true;
+        }
+
+        if let Some(firewall) = composer.firewall.as_ref() {
+            // Find the TAP name from the network interface the composer just added.
+            // If there's no TAP, skip firewall (it'd jump from a non-existent iface).
+            if let Some(tap) = spec
+                .network_interfaces
+                .last()
+                .map(|i| i.host_dev_name.clone())
+            {
+                firewall.install(vm_id, &tap, &[])?;
+                attachments.firewall_installed = true;
+            }
+        }
+
+        // Jailer composition is gated on the spawn_firecracker rewrite that wires
+        // the chroot'd API socket back to the host. Tracked for the next milestone;
+        // for now the composer flag is accepted but produces no action.
+        if composer.jailer.is_some() {
+            attachments.jail_prepared = false;
+        }
+
+        Ok((spec, attachments))
+    }
+
+    /// Release composer-side attachments for `vm_id`. Idempotent — every step is
+    /// best-effort and never errors out.
+    fn compose_release(&self, vm_id: &str, attachments: &ComposedAttachments) {
+        let Some(composer) = self.composer.clone() else {
+            return;
+        };
+
+        if attachments.firewall_installed
+            && let Some(firewall) = composer.firewall.as_ref()
+        {
+            let _ = firewall.uninstall(vm_id);
+        }
+
+        if attachments.vsock_attached
+            && let Some(vsock) = composer.vsock.as_ref()
+        {
+            let _ = vsock.detach(vm_id);
+        }
+
+        if attachments.network_attached
+            && let Some(network) = composer.network.as_ref()
+        {
+            let _ = network.detach(vm_id);
+        }
+
+        if attachments.jail_prepared
+            && let Some(jailer) = composer.jailer.as_ref()
+        {
+            let _ = jailer.teardown(vm_id);
+        }
     }
 
     fn wait_for_socket_ready(&self, socket_path: &Path) -> VmRuntimeResult<()> {
@@ -327,6 +488,43 @@ impl FirecrackerVmProvider {
             self.put_network_interface(socket_path, iface)?;
         }
 
+        for drive in &spec.extra_drives {
+            self.put_extra_drive(socket_path, drive)?;
+        }
+
+        if let Some(vsock) = spec.vsock.as_ref() {
+            self.put_vsock(socket_path, vsock)?;
+        }
+
+        Ok(())
+    }
+
+    fn put_extra_drive(&self, socket_path: &Path, drive: &DriveSpec) -> VmRuntimeResult<()> {
+        if drive.drive_id == "rootfs" {
+            return Err(VmRuntimeError::Unsupported(
+                "drive_id 'rootfs' is reserved for the root device".into(),
+            ));
+        }
+        let mut body = serde_json::json!({
+            "drive_id": drive.drive_id,
+            "path_on_host": drive.path_on_host,
+            "is_root_device": false,
+            "is_read_only": drive.is_read_only,
+        });
+        if let Some(limiter) = drive.rate_limiter.as_ref() {
+            body["rate_limiter"] = rate_limiter_to_json(limiter);
+        }
+        let path = format!("/drives/{}", drive.drive_id);
+        self.firecracker_request(socket_path, "PUT", &path, Some(body))?;
+        Ok(())
+    }
+
+    fn put_vsock(&self, socket_path: &Path, vsock: &VsockSpec) -> VmRuntimeResult<()> {
+        let body = serde_json::json!({
+            "guest_cid": vsock.cid,
+            "uds_path": vsock.uds_path,
+        });
+        self.firecracker_request(socket_path, "PUT", "/vsock", Some(body))?;
         Ok(())
     }
 
@@ -558,23 +756,42 @@ impl FirecrackerVmProvider {
             }
         }
 
+        // Run composer-side pre-spawn primitives (network/vsock/firewall) and
+        // augment the spec accordingly. Composer is opt-in; bare semantics
+        // unchanged when it's None.
+        let (effective_spec, attachments) = self.compose_pre_spawn(vm_id, spec.clone())?;
+
         let socket_path = self.api_socket_path(vm_id);
         let state_dir = self.vm_state_path(vm_id);
         fs::create_dir_all(&state_dir).map_err(|e| {
+            self.compose_release(vm_id, &attachments);
             VmRuntimeError::Unsupported(format!(
                 "failed creating vm state dir {}: {e}",
                 state_dir.display()
             ))
         })?;
 
-        let mut child = self.spawn_firecracker(vm_id, &socket_path)?;
-        let restoring = spec.restore_from.is_some();
+        let capture_stderr = self
+            .composer
+            .as_ref()
+            .map(|c| c.capture_console)
+            .unwrap_or(false);
+
+        let mut child =
+            match self.spawn_firecracker_for_compose(vm_id, &socket_path, capture_stderr) {
+                Ok(c) => c,
+                Err(e) => {
+                    self.compose_release(vm_id, &attachments);
+                    return Err(e);
+                }
+            };
+        let restoring = effective_spec.restore_from.is_some();
         let configure_result = (|| -> VmRuntimeResult<()> {
             self.wait_for_socket_ready(&socket_path)?;
-            if let Some(snapshot) = spec.restore_from.as_ref() {
+            if let Some(snapshot) = effective_spec.restore_from.as_ref() {
                 self.load_snapshot(&socket_path, snapshot)?;
             } else {
-                self.configure_vm(&socket_path, spec)?;
+                self.configure_vm(&socket_path, &effective_spec)?;
             }
             Ok(())
         })();
@@ -582,13 +799,35 @@ impl FirecrackerVmProvider {
         if let Err(err) = configure_result {
             let _ = child.kill();
             let _ = child.wait();
+            self.compose_release(vm_id, &attachments);
             return Err(err);
+        }
+
+        // If console capture is enabled, attach the drainer to the child's stderr now
+        // (stderr was piped during spawn). Captured early so kernel panics during
+        // first boot are visible.
+        if capture_stderr && let Some(stderr) = child.stderr.take() {
+            let capture = ConsoleCapture::attach(stderr, ConsoleConfig::default());
+            if let Ok(mut consoles) = self.consoles.lock() {
+                consoles.insert(vm_id.to_owned(), capture);
+            }
         }
 
         self.processes
             .lock()
             .map_err(|_| VmRuntimeError::StatePoisoned)?
             .insert(vm_id.to_owned(), child);
+
+        if attachments.network_attached
+            || attachments.vsock_attached
+            || attachments.firewall_installed
+            || attachments.jail_prepared
+        {
+            self.composed
+                .lock()
+                .map_err(|_| VmRuntimeError::StatePoisoned)?
+                .insert(vm_id.to_owned(), attachments);
+        }
 
         // Restored VMs honour the snapshot's `resume_vm` flag — if `resume_immediately`
         // was set, the FC API call already transitioned the VM to Running; otherwise
@@ -622,11 +861,47 @@ impl FirecrackerVmProvider {
             .map_err(|_| VmRuntimeError::StatePoisoned)?
             .remove(vm_id);
 
+        let use_graceful = self
+            .composer
+            .as_ref()
+            .map(|c| c.graceful_shutdown)
+            .unwrap_or(false);
+
         if let Some(mut child) = child {
-            let _ = child.kill();
-            let _ = child.wait();
+            if use_graceful && let Some(composer) = self.composer.as_ref() {
+                let _ = graceful_shutdown(&mut child, &composer.shutdown_config);
+            } else {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
+
+        // Always drop the console capture, regardless of shutdown mode — the FC
+        // child is going away either way and the drainer thread should exit on EOF.
+        if let Ok(mut consoles) = self.consoles.lock() {
+            consoles.remove(vm_id);
+        }
+
+        // Release composer-managed attachments (firewall chain, TAP, vsock CID, jail).
+        let attachments = self
+            .composed
+            .lock()
+            .map_err(|_| VmRuntimeError::StatePoisoned)?
+            .remove(vm_id);
+        if let Some(a) = attachments {
+            self.compose_release(vm_id, &a);
+        }
+
         Ok(())
+    }
+
+    /// Tail captured stderr for a VM. Returns `None` if console capture is disabled or
+    /// the VM has no recorded capture. Useful for post-mortem when a VM exits unexpectedly.
+    pub fn console_tail(&self, vm_id: &str) -> Option<Vec<String>> {
+        self.consoles
+            .lock()
+            .ok()
+            .and_then(|c| c.get(vm_id).map(|cap| cap.tail()))
     }
 }
 

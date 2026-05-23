@@ -5,6 +5,8 @@
 
 pub mod adapters;
 #[cfg(feature = "firecracker")]
+pub mod composer;
+#[cfg(feature = "firecracker")]
 pub mod console;
 pub mod error;
 #[cfg(feature = "firecracker")]
@@ -26,6 +28,8 @@ pub mod vsock;
 pub use adapters::firecracker::{FirecrackerConfig, FirecrackerVmProvider};
 pub use adapters::in_memory::InMemoryVmProvider;
 #[cfg(feature = "firecracker")]
+pub use composer::FirecrackerComposer;
+#[cfg(feature = "firecracker")]
 pub use console::{ConsoleCapture, ConsoleConfig};
 pub use error::{VmRuntimeError, VmRuntimeResult};
 #[cfg(feature = "firecracker")]
@@ -35,7 +39,8 @@ pub use jailer::{Jailer, JailerConfig, VmJail};
 #[cfg(feature = "firecracker")]
 pub use metrics::{MetricsConfig, MetricsPoller, VmMetricsSnapshot};
 pub use model::{
-    NetworkInterface, RateLimiter, SnapshotRef, TokenBucket, VmSpec, VmStatus, VmView,
+    DriveSpec, NetworkInterface, RateLimiter, SnapshotRef, TokenBucket, VmSpec, VmStatus, VmView,
+    VsockSpec,
 };
 #[cfg(feature = "firecracker")]
 pub use network::{Ipv4Net, NetworkConfig, NetworkManager, VmNetwork};

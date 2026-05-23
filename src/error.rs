@@ -51,4 +51,12 @@ pub enum VmRuntimeError {
     /// Jailer chroot preparation, command construction, or teardown failed.
     #[error("jailer error: {0}")]
     Jailer(String),
+
+    /// Network configuration is malformed (bad CIDR, prefix out of range, etc).
+    #[error("network config invalid: {0}")]
+    NetworkConfig(String),
+
+    /// Host network setup or teardown failed (bridge/NAT/forward/TAP).
+    #[error("network setup failed: {0}")]
+    NetworkSetup(String),
 }

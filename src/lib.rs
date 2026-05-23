@@ -14,6 +14,8 @@ pub mod jailer;
 #[cfg(feature = "firecracker")]
 pub mod metrics;
 pub mod model;
+#[cfg(feature = "firecracker")]
+pub mod network;
 pub mod provider;
 #[cfg(feature = "firecracker")]
 pub mod shutdown;
@@ -33,6 +35,8 @@ pub use jailer::{Jailer, JailerConfig, VmJail};
 #[cfg(feature = "firecracker")]
 pub use metrics::{MetricsConfig, MetricsPoller, VmMetricsSnapshot};
 pub use model::{VmStatus, VmView};
+#[cfg(feature = "firecracker")]
+pub use network::{Ipv4Net, NetworkConfig, NetworkManager, VmNetwork};
 pub use provider::{VmProvider, VmQuery, VmRuntime};
 #[cfg(feature = "firecracker")]
 pub use shutdown::{ShutdownConfig, ShutdownOutcome, graceful_shutdown};

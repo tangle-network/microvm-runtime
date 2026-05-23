@@ -18,6 +18,12 @@ serde_json = "1"
 thiserror = "2"
 # Used only by the `firecracker` feature for the jailer module (mknod, chown).
 nix = { version = "0.30", default-features = false, features = ["fs", "user"], optional = true }
+# Streaming SHA-256 for the rootfs catalog + snapshot integrity helpers.
+# `sha2` is the de-facto Rust SHA-2 crate (also the RustCrypto reference impl);
+# selecting it specifically (over `ring`/`openssl`) keeps the supply-chain
+# surface to a single pure-Rust crate with no C dependencies, no FFI, and a
+# stable 0.10 line that has not had a security advisory in years.
+sha2 = { version = "0.10", default-features = false, optional = true }
 
 # `libc` is only pulled in on Linux. It exists solely so
 # `shutdown::graceful_shutdown` can call `kill(2)` directly with `SIGTERM`;
@@ -34,4 +40,4 @@ tempfile = "3"
 default = []
 # Enables the in-process Firecracker driver. Requires a host running KVM and
 # a Firecracker binary reachable via PATH (or `MICROVM_FIRECRACKER_BIN`).
-firecracker = ["dep:nix"]
+firecracker = ["dep:nix", "dep:sha2"]

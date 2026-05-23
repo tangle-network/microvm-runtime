@@ -63,4 +63,9 @@ pub enum VmRuntimeError {
     /// Host network setup or teardown failed (bridge/NAT/forward/TAP).
     #[error("network setup failed: {0}")]
     NetworkSetup(String),
+
+    /// Rootfs catalog discovery, per-VM clone, or SHA-256 integrity check
+    /// failed (missing template, stamp mismatch, hash mismatch, I/O error).
+    #[error("rootfs: {0}")]
+    Rootfs(String),
 }

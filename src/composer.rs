@@ -1,4 +1,4 @@
-//! Auto-composition of [`FirecrackerVmProvider`] with the per-VM lifecycle modules.
+//! Auto-composition of [`FirecrackerVmProvider`](crate::FirecrackerVmProvider) with the per-VM lifecycle modules.
 //!
 //! By default the Firecracker adapter is bare: callers pass a [`crate::model::VmSpec`]
 //! with whatever fields they want and the adapter writes them into the FC API. Networking,

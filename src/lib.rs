@@ -20,6 +20,8 @@ pub mod model;
 pub mod network;
 pub mod provider;
 #[cfg(feature = "firecracker")]
+pub mod rootfs;
+#[cfg(feature = "firecracker")]
 pub mod shutdown;
 #[cfg(feature = "firecracker")]
 pub mod vsock;
@@ -45,6 +47,8 @@ pub use model::{
 #[cfg(feature = "firecracker")]
 pub use network::{Ipv4Net, NetworkConfig, NetworkManager, VmNetwork};
 pub use provider::{VmProvider, VmQuery, VmRuntime};
+#[cfg(feature = "firecracker")]
+pub use rootfs::{RootfsConfig, RootfsRegistry, StackInfo, VmRootfs};
 #[cfg(feature = "firecracker")]
 pub use shutdown::{ShutdownConfig, ShutdownOutcome, graceful_shutdown};
 #[cfg(feature = "firecracker")]

@@ -75,4 +75,10 @@ pub enum VmRuntimeError {
     /// the region-mapping payload Firecracker sends with the fd.
     #[error("uffd error: {0}")]
     Uffd(String),
+
+    /// Communication with the in-guest metadata daemon failed (UDS connect,
+    /// Firecracker `CONNECT` handshake, JSON encode/decode, request timeout,
+    /// or guest-reported failure).
+    #[error("guest metadata: {0}")]
+    GuestMetadata(String),
 }

@@ -12,6 +12,8 @@ pub mod error;
 #[cfg(feature = "firecracker")]
 pub mod firewall;
 #[cfg(feature = "firecracker")]
+pub mod guest_metadata;
+#[cfg(feature = "firecracker")]
 pub mod jailer;
 #[cfg(feature = "firecracker")]
 pub mod metrics;
@@ -38,6 +40,11 @@ pub use console::{ConsoleCapture, ConsoleConfig};
 pub use error::{VmRuntimeError, VmRuntimeResult};
 #[cfg(feature = "firecracker")]
 pub use firewall::{EgressRule, Firewall, FirewallConfig, VmEgressRules};
+#[cfg(feature = "firecracker")]
+pub use guest_metadata::{
+    DEFAULT_CONNECT_TIMEOUT, DEFAULT_GUEST_METADATA_PORT, DEFAULT_REQUEST_TIMEOUT,
+    GuestMetadataClient, GuestMetadataConfig, GuestMetadataConn, OwnedRequest, Request, Response,
+};
 #[cfg(feature = "firecracker")]
 pub use jailer::{Jailer, JailerConfig, VmJail};
 #[cfg(feature = "firecracker")]

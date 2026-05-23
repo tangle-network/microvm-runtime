@@ -24,6 +24,8 @@ pub mod rootfs;
 #[cfg(feature = "firecracker")]
 pub mod shutdown;
 #[cfg(feature = "firecracker")]
+pub mod uffd;
+#[cfg(feature = "firecracker")]
 pub mod vsock;
 
 #[cfg(feature = "firecracker")]
@@ -51,5 +53,7 @@ pub use provider::{VmProvider, VmQuery, VmRuntime};
 pub use rootfs::{RootfsConfig, RootfsRegistry, StackInfo, VmRootfs};
 #[cfg(feature = "firecracker")]
 pub use shutdown::{ShutdownConfig, ShutdownOutcome, graceful_shutdown};
+#[cfg(feature = "firecracker")]
+pub use uffd::{UffdConfig, UffdHandler, snapshot_load_mem_backend_uffd};
 #[cfg(feature = "firecracker")]
 pub use vsock::{VmVsock, VsockConfig, VsockManager};

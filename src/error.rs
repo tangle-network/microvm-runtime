@@ -68,4 +68,11 @@ pub enum VmRuntimeError {
     /// failed (missing template, stamp mismatch, hash mismatch, I/O error).
     #[error("rootfs: {0}")]
     Rootfs(String),
+
+    /// Userfaultfd page-fault handler failed to bind, hand-shake, or service
+    /// page faults. The variant is intentionally a free-form message because
+    /// the failure modes range from libc errno values to JSON parse errors on
+    /// the region-mapping payload Firecracker sends with the fd.
+    #[error("uffd error: {0}")]
+    Uffd(String),
 }

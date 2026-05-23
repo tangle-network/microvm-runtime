@@ -16,8 +16,10 @@ categories = ["virtualization", "os::linux-apis"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-# Used only by the `firecracker` feature for the jailer module (mknod, chown).
-nix = { version = "0.30", default-features = false, features = ["fs", "user"], optional = true }
+# Used by the `firecracker` feature for:
+# - jailer: `fs` (mknod) and `user` (chown).
+# - uffd:   `socket` (recvmsg + SCM_RIGHTS) and `uio` (IoSliceMut for cmsg recv).
+nix = { version = "0.30", default-features = false, features = ["fs", "user", "socket", "uio"], optional = true }
 # Streaming SHA-256 for the rootfs catalog + snapshot integrity helpers.
 # `sha2` is the de-facto Rust SHA-2 crate (also the RustCrypto reference impl);
 # selecting it specifically (over `ring`/`openssl`) keeps the supply-chain
@@ -25,13 +27,22 @@ nix = { version = "0.30", default-features = false, features = ["fs", "user"], o
 # stable 0.10 line that has not had a security advisory in years.
 sha2 = { version = "0.10", default-features = false, optional = true }
 
-# `libc` is only pulled in on Linux. It exists solely so
-# `shutdown::graceful_shutdown` can call `kill(2)` directly with `SIGTERM`;
-# `std::process::Child::kill` is hard-coded to `SIGKILL` and would defeat the
-# purpose of graceful teardown. Gated by target_os so non-Linux builds (where
-# the firecracker feature is meaningless) do not pull it in.
+# `libc` is only pulled in on Linux. Used by:
+# - `shutdown::graceful_shutdown` to call `kill(2)` with `SIGTERM` directly
+#   (`std::process::Child::kill` is hard-coded to `SIGKILL`).
+# - `uffd` for `mmap`/`poll`/`MAP_PRIVATE` constants the userfaultfd handler
+#   needs to map the snapshot mem file and poll the uffd fd for events.
+# Gated by target_os so non-Linux builds (where the firecracker feature is
+# meaningless) do not pull it in.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+# `userfaultfd` is the canonical Rust wrapper around the `userfaultfd(2)`
+# syscall family. Used only by `crate::uffd` to service page faults Firecracker
+# raises on a snapshot-restored guest. Linux-only, gated on the `firecracker`
+# feature so docs.rs builds (and `cargo test --no-default-features`) don't pull
+# it in. Pinned to 0.8 — the only series that builds cleanly on edition 2024 +
+# rustc 1.91 at the time of writing (0.9 exists but requires a newer nix).
+userfaultfd = { version = "0.8", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -40,4 +51,4 @@ tempfile = "3"
 default = []
 # Enables the in-process Firecracker driver. Requires a host running KVM and
 # a Firecracker binary reachable via PATH (or `MICROVM_FIRECRACKER_BIN`).
-firecracker = ["dep:nix", "dep:sha2"]
+firecracker = ["dep:nix", "dep:sha2", "dep:userfaultfd"]

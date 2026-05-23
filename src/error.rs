@@ -33,4 +33,8 @@ pub enum VmRuntimeError {
     /// Backend is not supported in the current build/config.
     #[error("backend unsupported: {0}")]
     Unsupported(String),
+
+    /// Metrics poller failed to open, parse, or read the FC metrics FIFO.
+    #[error("metrics: {0}")]
+    Metrics(String),
 }

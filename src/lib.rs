@@ -7,6 +7,8 @@ pub mod adapters;
 #[cfg(feature = "firecracker")]
 pub mod console;
 pub mod error;
+#[cfg(feature = "firecracker")]
+pub mod metrics;
 pub mod model;
 pub mod provider;
 
@@ -19,6 +21,8 @@ pub use adapters::in_memory::InMemoryVmProvider;
 #[cfg(feature = "firecracker")]
 pub use console::{ConsoleCapture, ConsoleConfig};
 pub use error::{VmRuntimeError, VmRuntimeResult};
+#[cfg(feature = "firecracker")]
+pub use metrics::{MetricsConfig, MetricsPoller, VmMetricsSnapshot};
 pub use model::{VmStatus, VmView};
 pub use provider::{VmProvider, VmQuery, VmRuntime};
 #[cfg(feature = "firecracker")]

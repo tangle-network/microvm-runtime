@@ -67,14 +67,48 @@ pub struct VmSpec {
     /// Network interfaces to attach pre-boot. Firecracker requires these to be configured
     /// before `InstanceStart`. Empty by default — the VM has no network unless explicitly set.
     pub network_interfaces: Vec<NetworkInterface>,
+    /// Additional drives beyond rootfs (e.g. workspace volume, sidecar, nix store).
+    /// Empty by default. Configured via `PUT /drives/<drive_id>`.
+    pub extra_drives: Vec<DriveSpec>,
+    /// Vsock device. When `Some`, configured via `PUT /vsock` before `InstanceStart`.
+    /// Required for guest↔host RPC channels (e.g. talking to a guest sidecar).
+    pub vsock: Option<VsockSpec>,
     /// If set, the VM boots from a snapshot via `PUT /snapshot/load` instead of cold-booting.
-    /// The spec's `kernel`, `rootfs`, `vcpu_count`, `mem_size_mib`, `boot_args`, and
-    /// `network_interfaces` are ignored when restoring (the snapshot encodes its own machine
-    /// config). Use [`SnapshotRef::network_overrides`] to swap network interfaces on restore.
+    /// The spec's `kernel`, `rootfs`, `vcpu_count`, `mem_size_mib`, `boot_args`,
+    /// `network_interfaces`, `extra_drives`, and `vsock` are ignored when restoring
+    /// (the snapshot encodes its own machine config). Use
+    /// [`SnapshotRef::network_overrides`] to swap network interfaces on restore.
     pub restore_from: Option<SnapshotRef>,
     /// Track dirty pages during execution — required to later capture diff snapshots.
     /// None = enabled (FC's safer default for snapshot-friendly workloads).
     pub track_dirty_pages: Option<bool>,
+}
+
+/// Additional drive beyond the rootfs.
+#[derive(Debug, Clone)]
+pub struct DriveSpec {
+    /// Identifier used by Firecracker for this drive (must be unique per VM).
+    pub drive_id: String,
+    /// Path on host to the backing file (ext4 image, or any block file).
+    pub path_on_host: PathBuf,
+    /// Mount as read-only in guest.
+    pub is_read_only: bool,
+    /// Optional bandwidth + ops rate limit.
+    pub rate_limiter: Option<RateLimiter>,
+}
+
+/// Vsock device config.
+///
+/// Firecracker's vsock implementation uses a unix socket on the host (`uds_path`) and
+/// a 32-bit Context ID (`cid`) that the guest reads to identify the channel.
+#[derive(Debug, Clone)]
+pub struct VsockSpec {
+    /// Guest context ID. Must not collide with other VMs on the same host.
+    /// Use [`crate::vsock::VsockManager`] to allocate.
+    pub cid: u32,
+    /// Host-side unix domain socket path. The parent directory MUST exist
+    /// before snapshot/load — see [`crate::vsock::VsockManager::ensure_uds_parent`].
+    pub uds_path: PathBuf,
 }
 
 /// Firecracker `RateLimiter` config, applicable to drives and network interfaces.

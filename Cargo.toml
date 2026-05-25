@@ -19,7 +19,7 @@ thiserror = "2"
 # Used by the `firecracker` feature for:
 # - jailer: `fs` (mknod) and `user` (chown).
 # - uffd:   `socket` (recvmsg + SCM_RIGHTS) and `uio` (IoSliceMut for cmsg recv).
-nix = { version = "0.30", default-features = false, features = ["fs", "user", "socket", "uio"], optional = true }
+nix = { version = "0.31", default-features = false, features = ["fs", "user", "socket", "uio"], optional = true }
 # Streaming SHA-256 for the rootfs catalog + snapshot integrity helpers.
 # `sha2` is the de-facto Rust SHA-2 crate (also the RustCrypto reference impl);
 # selecting it specifically (over `ring`/`openssl`) keeps the supply-chain

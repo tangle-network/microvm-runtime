@@ -47,7 +47,7 @@ libc = "0.2"
 # feature so docs.rs builds (and `cargo test --no-default-features`) don't pull
 # it in. Pinned to 0.8 — the only series that builds cleanly on edition 2024 +
 # rustc 1.91 at the time of writing (0.9 exists but requires a newer nix).
-userfaultfd = { version = "0.8", optional = true }
+userfaultfd = { version = "0.9", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

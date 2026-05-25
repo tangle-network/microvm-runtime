@@ -25,7 +25,7 @@ nix = { version = "0.30", default-features = false, features = ["fs", "user", "s
 # selecting it specifically (over `ring`/`openssl`) keeps the supply-chain
 # surface to a single pure-Rust crate with no C dependencies, no FFI, and a
 # stable 0.10 line that has not had a security advisory in years.
-sha2 = { version = "0.10", default-features = false, optional = true }
+sha2 = { version = "0.11", default-features = false, optional = true }
 # `base64` is used by the `guest_metadata` module to encode raw secret bytes
 # onto the newline-delimited JSON wire format that talks to the in-guest
 # daemon. The crate is the de-facto pure-Rust base64 implementation; gated

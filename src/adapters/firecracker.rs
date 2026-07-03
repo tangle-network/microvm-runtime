@@ -74,6 +74,91 @@ fn mem_backend_from_env_value(value: Option<&str>) -> MemBackend {
     }
 }
 
+/// Read one HTTP/1.1 response from `stream` by its framing: headers up to
+/// the blank line, then exactly `Content-Length` body bytes (0 when the
+/// header is absent — Firecracker's micro_http always sends it on non-empty
+/// bodies). Returns the raw bytes (headers + body).
+///
+/// Reading to EOF is not an option here: Firecracker's API server holds the
+/// connection open regardless of `Connection: close`, so an EOF-terminated
+/// read blocks until the socket read timeout on every request.
+fn read_http_response(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
+    // Cap header growth so a misbehaving server cannot balloon memory; FC
+    // response headers are well under 1 KiB.
+    const MAX_HEADER_BYTES: usize = 64 * 1024;
+
+    let mut response: Vec<u8> = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        if let Some(pos) = find_subslice(&response, b"\r\n\r\n") {
+            break pos + 4;
+        }
+        if response.len() > MAX_HEADER_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "response headers exceed 64 KiB without terminator",
+            ));
+        }
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed before response headers completed",
+            ));
+        }
+        response.extend_from_slice(&chunk[..n]);
+    };
+
+    let headers_text = String::from_utf8_lossy(&response[..header_end]);
+    if headers_text
+        .lines()
+        .any(|l| l.to_ascii_lowercase().starts_with("transfer-encoding:"))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "transfer-encoded responses are not supported",
+        ));
+    }
+    let content_length = headers_text
+        .lines()
+        .find_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>())
+        })
+        .transpose()
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid Content-Length: {e}"),
+            )
+        })?
+        .unwrap_or(0);
+
+    let total = header_end.checked_add(content_length).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "Content-Length overflow")
+    })?;
+    while response.len() < total {
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed mid-body",
+            ));
+        }
+        response.extend_from_slice(&chunk[..n]);
+    }
+    response.truncate(total);
+    Ok(response)
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 #[derive(Debug, Clone)]
 struct VmRecord {
     status: VmStatus,
@@ -1035,8 +1120,14 @@ impl FirecrackerVmProvider {
             ))
         })?;
 
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).map_err(|e| {
+        // Firecracker's API server keeps the connection alive even when the
+        // request says `Connection: close` (measured on v1.6 and v1.12: the
+        // response carries `Connection: keep-alive` and the server never
+        // half-closes). `read_to_end` therefore never sees EOF and blocks
+        // until the read timeout, failing every call — read the response by
+        // its framing (headers, then exactly `Content-Length` body bytes)
+        // instead of waiting for a close that never comes.
+        let response = read_http_response(&mut stream).map_err(|e| {
             VmRuntimeError::Unsupported(format!(
                 "failed reading firecracker response {method} {endpoint}: {e}"
             ))
@@ -1714,6 +1805,47 @@ mod tests {
     use crate::composer::FirecrackerComposer;
     use crate::jailer::{Jailer, JailerConfig};
     use crate::model::{RateLimiter, TokenBucket};
+
+    /// Named bug: Firecracker's API server keeps the connection alive even
+    /// for `Connection: close` requests, so an EOF-terminated read
+    /// (`read_to_end`) blocks until the socket read timeout on every call —
+    /// `create_vm` then fails with "api socket not ready" against a
+    /// perfectly healthy VMM. The response must be read by its framing.
+    #[test]
+    fn read_http_response_returns_without_server_close() {
+        let (mut client, mut server) = UnixStream::pair().expect("socketpair");
+        let response =
+            b"HTTP/1.1 200 \r\nServer: Firecracker API\r\nConnection: keep-alive\r\nContent-Type: application/json\r\nContent-Length: 13\r\n\r\n{\"state\":\"a\"}";
+        server.write_all(response).expect("write response");
+        server.flush().expect("flush");
+        // Deliberately NOT closing/dropping `server`: the read must complete
+        // on framing alone. The timeout only bounds a regression — with the
+        // read_to_end implementation this test hangs here and fails.
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let got = read_http_response(&mut client).expect("framed read completes without EOF");
+        assert_eq!(got, response.to_vec());
+        drop(server);
+    }
+
+    /// Body split across reads with no Content-Length on empty-body
+    /// responses (Firecracker's 204-style action replies).
+    #[test]
+    fn read_http_response_handles_missing_content_length() {
+        let (mut client, mut server) = UnixStream::pair().expect("socketpair");
+        server
+            .write_all(
+                b"HTTP/1.1 204 \r\nServer: Firecracker API\r\nConnection: keep-alive\r\n\r\n",
+            )
+            .expect("write response");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let got = read_http_response(&mut client).expect("headers-only response");
+        assert!(got.ends_with(b"\r\n\r\n"));
+        drop(server);
+    }
 
     fn test_config(root: &Path) -> FirecrackerConfig {
         FirecrackerConfig {

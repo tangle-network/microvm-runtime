@@ -66,9 +66,12 @@ const DEFAULT_CGROUP_PARENT: &str = "microvm.slice";
 const DEFAULT_UID: u32 = 123;
 const DEFAULT_GID: u32 = 100;
 
-const KERNEL_BASENAME: &str = "vmlinux";
-const ROOTFS_BASENAME: &str = "rootfs.ext4";
-const API_SOCKET_BASENAME: &str = "api.sock";
+// Shared with the firecracker adapter: a jailed FC must be given these
+// in-chroot names for boot-source / drives instead of the host paths that
+// `prepare()` staged them from.
+pub(crate) const KERNEL_BASENAME: &str = "vmlinux";
+pub(crate) const ROOTFS_BASENAME: &str = "rootfs.ext4";
+pub(crate) const API_SOCKET_BASENAME: &str = "api.sock";
 
 // `dev` major:minor pairs. These are stable Linux ABI:
 //   /dev/kvm        c 10 232
@@ -262,11 +265,7 @@ impl Jailer {
         link_or_copy(kernel, &chroot_path.join(KERNEL_BASENAME))?;
         link_or_copy(rootfs, &chroot_path.join(ROOTFS_BASENAME))?;
         for (idx, drive) in extra_drives.iter().enumerate() {
-            let basename = drive
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| format!("drive-{idx}.img"));
-            link_or_copy(drive, &chroot_path.join(basename))?;
+            link_or_copy(drive, &chroot_path.join(staged_drive_basename(drive, idx)))?;
         }
 
         ensure_char_device(&chroot_path.join("dev").join("kvm"), KVM_MAJOR, KVM_MINOR)?;
@@ -407,6 +406,43 @@ pub fn safe_vm_id(vm_id: &str) -> String {
             }
         })
         .collect()
+}
+
+/// In-chroot basename an extra drive is staged under by [`Jailer::prepare`].
+/// The firecracker adapter uses the same function to compute the `path_on_host`
+/// it hands to a jailed FC, so the two can never disagree.
+pub(crate) fn staged_drive_basename(drive: &Path, idx: usize) -> String {
+    drive
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| format!("drive-{idx}.img"))
+}
+
+/// Stage a read-only snapshot artifact into a chroot at `dest` so a jailed,
+/// privilege-dropped Firecracker can open it on `/snapshot/load`.
+///
+/// Hard-links when source and chroot share a filesystem — instant, and a
+/// multi-GiB memory image is never byte-copied; FC mmaps its hard link
+/// `MAP_PRIVATE`, so the durable image stays pristine and shareable across
+/// concurrent restores. Falls back to a copy on `EXDEV`. Ownership is handed
+/// to the jail uid/gid because FC opens the file after dropping privileges;
+/// a chown failure (needs `CAP_CHOWN`) is reported on stderr but not fatal —
+/// FC's own `open(2)` fails the restore loudly if permissions actually block.
+pub(crate) fn stage_chroot_file(
+    src: &Path,
+    dest: &Path,
+    uid: u32,
+    gid: u32,
+) -> VmRuntimeResult<()> {
+    link_or_copy(src, dest)?;
+    if let Err(err) = chown(dest, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))) {
+        eprintln!(
+            "[microvm-jailer] chown {} to {uid}:{gid} failed ({err}); \
+             the jailed firecracker may be unable to open it",
+            dest.display()
+        );
+    }
+    Ok(())
 }
 
 fn create_dir_all(path: &Path) -> VmRuntimeResult<()> {
@@ -761,6 +797,49 @@ mod tests {
         assert!(vm_dir.exists());
         j.teardown("vm-1").expect("teardown ok");
         assert!(!vm_dir.exists());
+    }
+
+    #[test]
+    fn staged_drive_basename_uses_file_name_or_index() {
+        assert_eq!(
+            staged_drive_basename(Path::new("/var/lib/fc/workspace.ext4"), 0),
+            "workspace.ext4"
+        );
+        // `..` has no final component — falls back to the indexed name.
+        assert_eq!(staged_drive_basename(Path::new(".."), 3), "drive-3.img");
+    }
+
+    #[test]
+    fn stage_chroot_file_hardlinks_into_chroot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("snap.mem");
+        fs::write(&src, b"guest memory").unwrap();
+        let chroot = tmp.path().join("root");
+        fs::create_dir_all(&chroot).unwrap();
+        let dest = chroot.join("snap.mem");
+
+        stage_chroot_file(&src, &dest, 123, 100).expect("stage");
+
+        // Same filesystem → must be a hard link (same inode), not a copy.
+        assert!(same_inode(&src, &dest).unwrap());
+        // Idempotent: a second stage of the same inode is a no-op.
+        stage_chroot_file(&src, &dest, 123, 100).expect("re-stage");
+        assert!(same_inode(&src, &dest).unwrap());
+    }
+
+    #[test]
+    fn stage_chroot_file_replaces_stale_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("snap.vmstate");
+        fs::write(&src, b"fresh state").unwrap();
+        let chroot = tmp.path().join("root");
+        fs::create_dir_all(&chroot).unwrap();
+        let dest = chroot.join("snap.vmstate");
+        fs::write(&dest, b"stale leftover from a previous restore").unwrap();
+
+        stage_chroot_file(&src, &dest, 123, 100).expect("stage over stale");
+        assert!(same_inode(&src, &dest).unwrap());
+        assert_eq!(fs::read(&dest).unwrap(), b"fresh state");
     }
 
     #[test]

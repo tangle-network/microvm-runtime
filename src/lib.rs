@@ -31,7 +31,7 @@ pub mod uffd;
 pub mod vsock;
 
 #[cfg(feature = "firecracker")]
-pub use adapters::firecracker::{FirecrackerConfig, FirecrackerVmProvider};
+pub use adapters::firecracker::{FirecrackerConfig, FirecrackerVmProvider, MemBackend};
 pub use adapters::in_memory::InMemoryVmProvider;
 #[cfg(feature = "firecracker")]
 pub use composer::FirecrackerComposer;

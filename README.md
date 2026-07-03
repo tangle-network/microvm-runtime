@@ -61,6 +61,7 @@ provider.destroy_vm("vm-1")?;
 | `MICROVM_FIRECRACKER_STATE_DIR` | `/var/lib/microvm/state` | Per-VM state dir |
 | `MICROVM_FIRECRACKER_VCPU` | `1` | Default vCPU count |
 | `MICROVM_FIRECRACKER_MEM_MIB` | `256` | Default memory size |
+| `MICROVM_MEM_BACKEND` | `file` | Snapshot-restore memory backend: `file` (FC reads the whole mem file before resume) or `uffd` (userfaultfd handler pages memory in on demand) |
 
 ## License
 

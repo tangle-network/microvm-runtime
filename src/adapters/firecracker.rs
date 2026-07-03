@@ -12,12 +12,14 @@ use crate::{
     composer::FirecrackerComposer,
     console::{ConsoleCapture, ConsoleConfig},
     error::{VmRuntimeError, VmRuntimeResult},
+    jailer::{self, VmJail},
     model::{
         DriveSpec, NetworkInterface, RateLimiter, SnapshotRef, TokenBucket, VmSpec, VmStatus,
         VmView, VsockSpec,
     },
     provider::{VmProvider, VmQuery},
     shutdown::graceful_shutdown,
+    uffd::{UffdConfig, UffdHandler, snapshot_load_mem_backend_uffd},
 };
 
 const DEFAULT_FIRECRACKER_BIN: &str = "/usr/local/bin/firecracker";
@@ -27,6 +29,50 @@ const DEFAULT_BOOT_ARGS: &str =
     "console=ttyS0 reboot=k panic=1 pci=off quiet i8042.nokbd i8042.noaux";
 const DEFAULT_API_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_SOCKET_READY_TIMEOUT_MS: u64 = 5_000;
+
+/// Basename of the per-VM userfaultfd socket used when
+/// [`MemBackend::Uffd`] is selected. Jailed VMs get it at the chroot root
+/// (FC connects to `/uffd.sock` post-chroot); non-jailed VMs get it in the
+/// VM's state dir.
+const UFFD_SOCKET_BASENAME: &str = "uffd.sock";
+
+/// Guest-memory backend Firecracker uses on `PUT /snapshot/load`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemBackend {
+    /// FC reads the whole snapshot mem file synchronously before resuming.
+    #[default]
+    File,
+    /// A [`crate::uffd::UffdHandler`] pages guest memory in on demand —
+    /// the VM resumes immediately and only touched pages are loaded.
+    Uffd,
+}
+
+impl std::str::FromStr for MemBackend {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "file" => Ok(Self::File),
+            "uffd" => Ok(Self::Uffd),
+            other => Err(format!(
+                "invalid memory backend '{other}' (expected 'file' or 'uffd')"
+            )),
+        }
+    }
+}
+
+/// Parse `MICROVM_MEM_BACKEND`. Absent → the `File` default; an invalid
+/// value panics rather than silently running with the wrong backend — a
+/// misconfigured operator must find out at startup, not on the first slow
+/// restore.
+fn mem_backend_from_env_value(value: Option<&str>) -> MemBackend {
+    match value {
+        None => MemBackend::default(),
+        Some(v) => v
+            .parse::<MemBackend>()
+            .unwrap_or_else(|e| panic!("MICROVM_MEM_BACKEND: {e}")),
+    }
+}
 
 #[derive(Debug, Clone)]
 struct VmRecord {
@@ -71,6 +117,10 @@ pub struct FirecrackerConfig {
     pub api_timeout: Duration,
     /// Max wait for Firecracker API socket readiness after process spawn.
     pub socket_ready_timeout: Duration,
+    /// Guest-memory backend for snapshot restore. `MICROVM_MEM_BACKEND`
+    /// accepts `file` (default) or `uffd`; an invalid value fails loudly at
+    /// config load.
+    pub mem_backend: MemBackend,
 }
 
 impl FirecrackerConfig {
@@ -120,6 +170,8 @@ impl FirecrackerConfig {
                 .filter(|v| *v > 0)
                 .unwrap_or(DEFAULT_SOCKET_READY_TIMEOUT_MS),
         );
+        let mem_backend =
+            mem_backend_from_env_value(std::env::var("MICROVM_MEM_BACKEND").ok().as_deref());
 
         Self {
             binary_path,
@@ -133,8 +185,149 @@ impl FirecrackerConfig {
             rootfs_read_only,
             api_timeout,
             socket_ready_timeout,
+            mem_backend,
         }
     }
+}
+
+/// Where one snapshot's artifacts (vmstate + guest memory) live on the host
+/// and how the — possibly chrooted — Firecracker process must address them.
+///
+/// * Non-jailed: all three views coincide; FC reads/writes the durable paths
+///   directly.
+/// * Jailed: FC resolves every path inside its chroot, so the API body gets
+///   `/<id>.vmstate` / `/<id>.mem` (`fc_*`), which land at `<chroot>/<id>.*`
+///   on the host (`staged_*`). Snapshot create moves the staged files to the
+///   durable home afterwards (the chroot dies with the VM); restore
+///   hard-links the durable files back in beforehand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotArtifactPaths {
+    /// Durable host home: `<state_dir>/<source_vm>/snapshots/<id>.{vmstate,mem}`.
+    durable_vmstate: PathBuf,
+    durable_mem: PathBuf,
+    /// Paths written into the FC API body — what the FC process resolves.
+    fc_vmstate: PathBuf,
+    fc_mem: PathBuf,
+    /// Host-side view of `fc_*`. Equal to `durable_*` when not jailed.
+    staged_vmstate: PathBuf,
+    staged_mem: PathBuf,
+}
+
+impl SnapshotArtifactPaths {
+    /// `true` when the staged (in-chroot) location differs from the durable
+    /// home, i.e. the VM is jailed and artifacts must be moved/linked.
+    fn is_staged(&self) -> bool {
+        self.staged_vmstate != self.durable_vmstate
+    }
+}
+
+/// Compute [`SnapshotArtifactPaths`] for `snapshot_id` under `snap_dir`
+/// (`<state_dir>/<vm>/snapshots`). `chroot` is `Some` when the FC process is
+/// jailed. Rejects snapshot ids that could escape the snapshot dir or the
+/// chroot — the id becomes a filename on both sides of the boundary.
+fn snapshot_artifact_paths(
+    snap_dir: &Path,
+    snapshot_id: &str,
+    chroot: Option<&Path>,
+) -> VmRuntimeResult<SnapshotArtifactPaths> {
+    if snapshot_id.is_empty()
+        || !snapshot_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        || snapshot_id.contains("..")
+    {
+        return Err(VmRuntimeError::Unsupported(format!(
+            "snapshot id '{snapshot_id}' is not a safe filename \
+             (allowed: [A-Za-z0-9._-], no '..')"
+        )));
+    }
+
+    let vmstate_name = format!("{snapshot_id}.vmstate");
+    let mem_name = format!("{snapshot_id}.mem");
+    let durable_vmstate = snap_dir.join(&vmstate_name);
+    let durable_mem = snap_dir.join(&mem_name);
+
+    Ok(match chroot {
+        // Jailed FC sees the chroot as `/`, so an artifact staged at
+        // `<chroot>/<name>` is addressed as `/<name>` in the API body.
+        Some(chroot) => SnapshotArtifactPaths {
+            fc_vmstate: PathBuf::from("/").join(&vmstate_name),
+            fc_mem: PathBuf::from("/").join(&mem_name),
+            staged_vmstate: chroot.join(&vmstate_name),
+            staged_mem: chroot.join(&mem_name),
+            durable_vmstate,
+            durable_mem,
+        },
+        None => SnapshotArtifactPaths {
+            fc_vmstate: durable_vmstate.clone(),
+            fc_mem: durable_mem.clone(),
+            staged_vmstate: durable_vmstate.clone(),
+            staged_mem: durable_mem.clone(),
+            durable_vmstate,
+            durable_mem,
+        },
+    })
+}
+
+/// Move a Firecracker-written snapshot artifact from its in-chroot staging
+/// path to the durable snapshot dir. Prefers `rename` (atomic, same-fs); the
+/// chroot base and the state dir can be different mounts, so falls back to a
+/// copy + unlink on `EXDEV`.
+fn move_into_place(from: &Path, to: &Path) -> VmRuntimeResult<()> {
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(nix::errno::Errno::EXDEV as i32) => {
+            fs::copy(from, to).map_err(|e| {
+                VmRuntimeError::Unsupported(format!(
+                    "failed copying snapshot artifact {} -> {}: {e}",
+                    from.display(),
+                    to.display()
+                ))
+            })?;
+            let _ = fs::remove_file(from);
+            Ok(())
+        }
+        Err(e) => Err(VmRuntimeError::Unsupported(format!(
+            "failed moving snapshot artifact {} -> {}: {e}",
+            from.display(),
+            to.display()
+        ))),
+    }
+}
+
+/// Build the `PUT /snapshot/load` body. `mem_backend` is either the `File`
+/// object pointing at the FC-visible mem path or the `Uffd` object pointing
+/// at the FC-visible handler socket (see
+/// [`crate::uffd::snapshot_load_mem_backend_uffd`]).
+fn build_snapshot_load_body(
+    snapshot: &SnapshotRef,
+    fc_vmstate: &Path,
+    mem_backend: serde_json::Value,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "snapshot_path": fc_vmstate,
+        "mem_backend": mem_backend,
+        "enable_diff_snapshots": false,
+        "resume_vm": snapshot.resume_immediately,
+    });
+    if !snapshot.network_overrides.is_empty() {
+        let overrides: Vec<_> = snapshot
+            .network_overrides
+            .iter()
+            .map(|iface| {
+                let mut entry = serde_json::json!({
+                    "iface_id": iface.iface_id,
+                    "host_dev_name": iface.host_dev_name,
+                });
+                if let Some(mac) = &iface.guest_mac {
+                    entry["guest_mac"] = serde_json::Value::String(mac.clone());
+                }
+                entry
+            })
+            .collect();
+        body["network_interfaces"] = serde_json::Value::Array(overrides);
+    }
+    body
 }
 
 /// Firecracker-backed provider surface.
@@ -156,6 +349,11 @@ pub struct FirecrackerVmProvider {
     /// Per-VM attachments owned by the composer (TAP, vsock, firewall rules, jail).
     /// Stored opaquely so destroy_vm can release them without re-deriving identifiers.
     composed: Arc<Mutex<HashMap<String, ComposedAttachments>>>,
+    /// Live userfaultfd page-fault handlers, one per VM restored with
+    /// [`MemBackend::Uffd`]. Each handler must outlive every page fault its
+    /// guest will ever raise, so it is held here until `destroy_vm` (drop
+    /// triggers an orderly shutdown).
+    uffd_handlers: Arc<Mutex<HashMap<String, UffdHandler>>>,
 }
 
 #[derive(Default, Clone)]
@@ -187,6 +385,7 @@ impl FirecrackerVmProvider {
             processes: Arc::new(Mutex::new(HashMap::new())),
             consoles: Arc::new(Mutex::new(HashMap::new())),
             composed: Arc::new(Mutex::new(HashMap::new())),
+            uffd_handlers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -372,10 +571,32 @@ impl FirecrackerVmProvider {
 
         // Restored VMs ignore network_interfaces / vsock from the spec (the snapshot
         // encodes them), so composing per-VM TAP / CID on restore is incorrect.
-        // The composer is a no-op when restoring; callers wanting to swap network on
-        // restore should populate `SnapshotRef::network_overrides` themselves.
+        // Callers wanting to swap network on restore should populate
+        // `SnapshotRef::network_overrides` themselves. The jailer is the exception:
+        // it is an isolation boundary, not guest config, so a restored VM must be
+        // chrooted exactly like a cold-booted one. The fresh chroot is prepared with
+        // the spec-resolved kernel/rootfs/drives so the in-chroot drive paths the
+        // snapshot recorded (`/rootfs.ext4`, drive basenames) resolve again, and
+        // `load_snapshot` stages the snapshot artifacts into it.
         if spec.restore_from.is_some() {
-            return Ok((spec, ComposedAttachments::default()));
+            let mut attachments = ComposedAttachments::default();
+            if let Some(jailer) = composer.jailer.as_ref() {
+                let kernel = spec
+                    .kernel
+                    .clone()
+                    .unwrap_or_else(|| self.config.kernel_path.clone());
+                let rootfs = spec
+                    .rootfs
+                    .clone()
+                    .unwrap_or_else(|| self.config.rootfs_path.clone());
+                let extra: Vec<PathBuf> = spec
+                    .extra_drives
+                    .iter()
+                    .map(|d| d.path_on_host.clone())
+                    .collect();
+                attachments.jail = Some(jailer.prepare(vm_id, &kernel, &rootfs, &extra)?);
+            }
+            return Ok((spec, attachments));
         }
 
         let mut attachments = ComposedAttachments::default();
@@ -493,7 +714,28 @@ impl FirecrackerVmProvider {
         )))
     }
 
-    fn configure_vm(&self, socket_path: &Path, spec: &VmSpec) -> VmRuntimeResult<()> {
+    fn configure_vm(
+        &self,
+        socket_path: &Path,
+        spec: &VmSpec,
+        jail: Option<&VmJail>,
+    ) -> VmRuntimeResult<()> {
+        let jailed = jail.is_some();
+
+        // A jailed FC would bind the vsock UDS inside its chroot while
+        // host-side clients dial the recorded host path — the two can never
+        // meet without chroot-aware staging in the vsock manager. Refuse up
+        // front (before any FC API call) with the remediation instead of
+        // surfacing FC's opaque bind failure.
+        if jailed && spec.vsock.is_some() {
+            return Err(VmRuntimeError::Unsupported(
+                "vsock under the jailer is not yet supported: the UDS path cannot \
+                 resolve both inside the chroot (for FC) and on the host (for \
+                 clients); set MICROVM_COMPOSE_VSOCK=0 or run without the jailer"
+                    .into(),
+            ));
+        }
+
         let vcpu_count = spec.vcpu_count.unwrap_or(self.config.vcpu_count);
         let mem_size_mib = spec.mem_size_mib.unwrap_or(self.config.mem_size_mib);
         let track_dirty_pages = spec.track_dirty_pages.unwrap_or(true);
@@ -505,7 +747,18 @@ impl FirecrackerVmProvider {
         });
         self.firecracker_request(socket_path, "PUT", "/machine-config", Some(machine))?;
 
-        let kernel_path = spec.kernel.as_ref().unwrap_or(&self.config.kernel_path);
+        // A jailed FC resolves every path inside its chroot, where the jailer
+        // staged the artifacts under fixed basenames — hand it those, not the
+        // host paths they were staged from. These in-chroot paths are also what
+        // the snapshot records, so a later restore into a fresh chroot (which
+        // stages the same basenames) resolves them again.
+        let kernel_path: PathBuf = if jailed {
+            PathBuf::from("/").join(jailer::KERNEL_BASENAME)
+        } else {
+            spec.kernel
+                .clone()
+                .unwrap_or_else(|| self.config.kernel_path.clone())
+        };
         let boot_args = spec.boot_args.as_deref().unwrap_or(&self.config.boot_args);
         let boot = serde_json::json!({
             "kernel_image_path": kernel_path,
@@ -513,7 +766,13 @@ impl FirecrackerVmProvider {
         });
         self.firecracker_request(socket_path, "PUT", "/boot-source", Some(boot))?;
 
-        let rootfs_path = spec.rootfs.as_ref().unwrap_or(&self.config.rootfs_path);
+        let rootfs_path: PathBuf = if jailed {
+            PathBuf::from("/").join(jailer::ROOTFS_BASENAME)
+        } else {
+            spec.rootfs
+                .clone()
+                .unwrap_or_else(|| self.config.rootfs_path.clone())
+        };
         let rootfs_read_only = spec
             .rootfs_read_only
             .unwrap_or(self.config.rootfs_read_only);
@@ -532,8 +791,18 @@ impl FirecrackerVmProvider {
             self.put_network_interface(socket_path, iface)?;
         }
 
-        for drive in &spec.extra_drives {
-            self.put_extra_drive(socket_path, drive)?;
+        for (idx, drive) in spec.extra_drives.iter().enumerate() {
+            if jailed {
+                // Same basename derivation as `Jailer::prepare` staged it under.
+                let staged = DriveSpec {
+                    path_on_host: PathBuf::from("/")
+                        .join(jailer::staged_drive_basename(&drive.path_on_host, idx)),
+                    ..drive.clone()
+                };
+                self.put_extra_drive(socket_path, &staged)?;
+            } else {
+                self.put_extra_drive(socket_path, drive)?;
+            }
         }
 
         if let Some(vsock) = spec.vsock.as_ref() {
@@ -595,47 +864,119 @@ impl FirecrackerVmProvider {
         Ok(())
     }
 
-    fn load_snapshot(&self, socket_path: &Path, snapshot: &SnapshotRef) -> VmRuntimeResult<()> {
-        let source_state_dir = self.vm_state_path(&snapshot.vm_id);
-        let snap_dir = source_state_dir.join("snapshots");
-        let vmstate_path = snap_dir.join(format!("{}.vmstate", snapshot.snapshot_id));
-        let mem_path = snap_dir.join(format!("{}.mem", snapshot.snapshot_id));
-        if !vmstate_path.exists() {
+    /// The jailer uid/gid snapshot artifacts must be chowned to so the
+    /// privilege-dropped FC can open them. Errors when a jail is present but
+    /// no jailer is composed — that combination cannot arise from this
+    /// adapter and indicates caller-side state corruption.
+    fn jailer_identity(&self) -> VmRuntimeResult<(u32, u32)> {
+        let jailer = self
+            .composer
+            .as_ref()
+            .and_then(|c| c.jailer.clone())
+            .ok_or_else(|| {
+                VmRuntimeError::Jailer(
+                    "vm has a jail but no jailer is composed on the provider".into(),
+                )
+            })?;
+        Ok((jailer.config().uid, jailer.config().gid))
+    }
+
+    /// Restore `target_vm_id` from `snapshot` via `PUT /snapshot/load`.
+    ///
+    /// Jail-aware: when the target VM runs under the jailer, the durable
+    /// snapshot artifacts are hard-linked into its fresh chroot and the API
+    /// body references them chroot-relative (a jailed FC resolves every path
+    /// inside its chroot — host-absolute paths ENOENT there).
+    ///
+    /// Returns the [`UffdHandler`] servicing guest page faults when
+    /// [`MemBackend::Uffd`] is configured (`None` for the `File` backend).
+    /// The caller must hold it for the VM's lifetime.
+    fn load_snapshot(
+        &self,
+        socket_path: &Path,
+        snapshot: &SnapshotRef,
+        target_vm_id: &str,
+        jail: Option<&VmJail>,
+    ) -> VmRuntimeResult<Option<UffdHandler>> {
+        let snap_dir = self.vm_state_path(&snapshot.vm_id).join("snapshots");
+        let paths = snapshot_artifact_paths(
+            &snap_dir,
+            &snapshot.snapshot_id,
+            jail.map(|j| j.chroot_path.as_path()),
+        )?;
+        if !paths.durable_vmstate.exists() || !paths.durable_mem.exists() {
             return Err(VmRuntimeError::SnapshotNotFound {
                 vm_id: snapshot.vm_id.clone(),
                 snapshot_id: snapshot.snapshot_id.clone(),
             });
         }
 
-        let mut body = serde_json::json!({
-            "snapshot_path": vmstate_path,
-            "mem_backend": {
-                "backend_type": "File",
-                "backend_path": mem_path,
-            },
-            "enable_diff_snapshots": false,
-            "resume_vm": snapshot.resume_immediately,
-        });
-        if !snapshot.network_overrides.is_empty() {
-            let overrides: Vec<_> = snapshot
-                .network_overrides
-                .iter()
-                .map(|iface| {
-                    let mut entry = serde_json::json!({
-                        "iface_id": iface.iface_id,
-                        "host_dev_name": iface.host_dev_name,
-                    });
-                    if let Some(mac) = &iface.guest_mac {
-                        entry["guest_mac"] = serde_json::Value::String(mac.clone());
-                    }
-                    entry
-                })
-                .collect();
-            body["network_interfaces"] = serde_json::Value::Array(overrides);
+        // Stage what the jailed FC opens itself: always the vmstate; the mem
+        // file only for the File backend (with UFFD our handler mmaps the
+        // durable mem file host-side and FC never opens it).
+        if jail.is_some() {
+            let (uid, gid) = self.jailer_identity()?;
+            jailer::stage_chroot_file(&paths.durable_vmstate, &paths.staged_vmstate, uid, gid)?;
+            if self.config.mem_backend == MemBackend::File {
+                jailer::stage_chroot_file(&paths.durable_mem, &paths.staged_mem, uid, gid)?;
+            }
         }
 
-        self.firecracker_request(socket_path, "PUT", "/snapshot/load", Some(body))?;
-        Ok(())
+        let (mem_backend, uffd_handler) = match self.config.mem_backend {
+            MemBackend::File => (
+                serde_json::json!({
+                    "backend_type": "File",
+                    "backend_path": paths.fc_mem,
+                }),
+                None,
+            ),
+            MemBackend::Uffd => {
+                // FC connects to the handler socket itself, so the socket must
+                // resolve from inside the chroot when jailed. The handler runs
+                // in this process (not chrooted) and mmaps the durable mem file.
+                let (host_socket, fc_socket) = match jail {
+                    Some(jail) => (
+                        jail.chroot_path.join(UFFD_SOCKET_BASENAME),
+                        PathBuf::from("/").join(UFFD_SOCKET_BASENAME),
+                    ),
+                    None => {
+                        let path = self.vm_state_path(target_vm_id).join(UFFD_SOCKET_BASENAME);
+                        (path.clone(), path)
+                    }
+                };
+                let handler = UffdHandler::start(UffdConfig {
+                    socket_path: host_socket.clone(),
+                    mem_file_path: paths.durable_mem.clone(),
+                })?;
+                if jail.is_some() {
+                    // connect(2) needs write permission on the socket file and
+                    // the jailed FC runs privilege-dropped. Best-effort like
+                    // the artifact chown: FC's connect fails the restore loudly
+                    // if permissions actually block.
+                    let (uid, gid) = self.jailer_identity()?;
+                    if let Err(err) = nix::unistd::chown(
+                        &host_socket,
+                        Some(nix::unistd::Uid::from_raw(uid)),
+                        Some(nix::unistd::Gid::from_raw(gid)),
+                    ) {
+                        eprintln!(
+                            "[microvm-uffd] chown {} to {uid}:{gid} failed ({err}); \
+                             the jailed firecracker may be unable to connect",
+                            host_socket.display()
+                        );
+                    }
+                }
+                (snapshot_load_mem_backend_uffd(&fc_socket), Some(handler))
+            }
+        };
+
+        let body = build_snapshot_load_body(snapshot, &paths.fc_vmstate, mem_backend);
+        match self.firecracker_request(socket_path, "PUT", "/snapshot/load", Some(body)) {
+            // Dropping the handler shuts it down; staged hard-links die with
+            // the chroot on compose_release.
+            Err(err) => Err(err),
+            Ok(_) => Ok(uffd_handler),
+        }
     }
 
     fn firecracker_request(
@@ -758,11 +1099,19 @@ impl FirecrackerVmProvider {
         Ok(())
     }
 
+    /// Capture a full snapshot via `PUT /snapshot/create`.
+    ///
+    /// Jail-aware: a jailed FC can only write inside its chroot, so it is
+    /// told to write `/<id>.vmstate` + `/<id>.mem` there; the files are then
+    /// moved to the durable snapshot dir, which survives the chroot teardown
+    /// and feeds every future restore. Non-jailed FC writes the durable
+    /// paths directly.
     fn create_snapshot(
         &self,
         socket_path: &Path,
         state_dir: &Path,
         snapshot_id: &str,
+        jail: Option<&VmJail>,
     ) -> VmRuntimeResult<()> {
         let snap_dir = state_dir.join("snapshots");
         fs::create_dir_all(&snap_dir).map_err(|e| {
@@ -771,20 +1120,42 @@ impl FirecrackerVmProvider {
                 snap_dir.display()
             ))
         })?;
-        let vmstate_path = snap_dir.join(format!("{snapshot_id}.vmstate"));
-        let mem_path = snap_dir.join(format!("{snapshot_id}.mem"));
-
-        self.firecracker_request(
-            socket_path,
-            "PUT",
-            "/snapshot/create",
-            Some(serde_json::json!({
-                "snapshot_type": "Full",
-                "snapshot_path": vmstate_path,
-                "mem_file_path": mem_path
-            })),
+        let paths = snapshot_artifact_paths(
+            &snap_dir,
+            snapshot_id,
+            jail.map(|j| j.chroot_path.as_path()),
         )?;
-        Ok(())
+
+        let result = self
+            .firecracker_request(
+                socket_path,
+                "PUT",
+                "/snapshot/create",
+                Some(serde_json::json!({
+                    "snapshot_type": "Full",
+                    "snapshot_path": paths.fc_vmstate,
+                    "mem_file_path": paths.fc_mem
+                })),
+            )
+            .and_then(|_| {
+                if paths.is_staged() {
+                    move_into_place(&paths.staged_vmstate, &paths.durable_vmstate)?;
+                    move_into_place(&paths.staged_mem, &paths.durable_mem)?;
+                }
+                Ok(())
+            });
+
+        if result.is_err() {
+            // Clean up partials at both the durable home and the in-chroot
+            // staging location (the jailed path can fail before the move).
+            let _ = fs::remove_file(&paths.durable_vmstate);
+            let _ = fs::remove_file(&paths.durable_mem);
+            if paths.is_staged() {
+                let _ = fs::remove_file(&paths.staged_vmstate);
+                let _ = fs::remove_file(&paths.staged_mem);
+            }
+        }
+        result
     }
 
     fn create_vm_inner(&self, vm_id: &str, spec: &VmSpec) -> VmRuntimeResult<()> {
@@ -841,12 +1212,14 @@ impl FirecrackerVmProvider {
             }
         };
         let restoring = effective_spec.restore_from.is_some();
+        let mut uffd_handler: Option<UffdHandler> = None;
         let configure_result = (|| -> VmRuntimeResult<()> {
             self.wait_for_socket_ready(&socket_path)?;
             if let Some(snapshot) = effective_spec.restore_from.as_ref() {
-                self.load_snapshot(&socket_path, snapshot)?;
+                uffd_handler =
+                    self.load_snapshot(&socket_path, snapshot, vm_id, attachments.jail.as_ref())?;
             } else {
-                self.configure_vm(&socket_path, &effective_spec)?;
+                self.configure_vm(&socket_path, &effective_spec, attachments.jail.as_ref())?;
             }
             Ok(())
         })();
@@ -872,6 +1245,15 @@ impl FirecrackerVmProvider {
             .lock()
             .map_err(|_| VmRuntimeError::StatePoisoned)?
             .insert(vm_id.to_owned(), child);
+
+        // The UFFD handler must outlive every page fault the restored guest
+        // will raise; parked here until destroy_vm (or rename re-keys it).
+        if let Some(handler) = uffd_handler {
+            self.uffd_handlers
+                .lock()
+                .map_err(|_| VmRuntimeError::StatePoisoned)?
+                .insert(vm_id.to_owned(), handler);
+        }
 
         if attachments.network_attached
             || attachments.vsock_attached
@@ -935,6 +1317,12 @@ impl FirecrackerVmProvider {
         // child is going away either way and the drainer thread should exit on EOF.
         if let Ok(mut consoles) = self.consoles.lock() {
             consoles.remove(vm_id);
+        }
+
+        // Drop the UFFD handler (drop = orderly shutdown): the FC process is
+        // gone, so no further page faults can arrive.
+        if let Ok(mut handlers) = self.uffd_handlers.lock() {
+            handlers.remove(vm_id);
         }
 
         // Release composer-managed attachments (firewall chain, TAP, vsock CID, jail).
@@ -1048,7 +1436,22 @@ impl VmProvider for FirecrackerVmProvider {
             });
         }
 
-        self.create_snapshot(&record.socket_path, &record.state_dir, snapshot_id)?;
+        // Jailed VMs must be told to write inside their chroot; fetch the jail
+        // recorded at create time. Lock order (state → composed) matches
+        // destroy_vm's state → processes → composed.
+        let jail = self
+            .composed
+            .lock()
+            .map_err(|_| VmRuntimeError::StatePoisoned)?
+            .get(vm_id)
+            .and_then(|a| a.jail.clone());
+
+        self.create_snapshot(
+            &record.socket_path,
+            &record.state_dir,
+            snapshot_id,
+            jail.as_ref(),
+        )?;
         record.snapshots.push(snapshot_id.to_owned());
         Ok(())
     }
@@ -1079,6 +1482,178 @@ impl VmProvider for FirecrackerVmProvider {
         let _ = fs::remove_dir_all(&record.state_dir);
 
         record.status = VmStatus::Destroyed;
+        Ok(())
+    }
+
+    /// Re-key a live VM — the warm-pool handoff: a pooled, pre-restored VM
+    /// swaps its identifier onto the claiming sandbox id without a
+    /// snapshot/load round-trip.
+    ///
+    /// Moves every piece of per-VM state the adapter lays out by id:
+    ///
+    /// * the state dir (`state_dir/<id>`, including its `snapshots/`),
+    /// * the API-socket holder — `socket_dir/<id>/` when bare, or the jailer
+    ///   vm dir (`<chroot_base>/firecracker/<id>/`) when jailed (renaming a
+    ///   directory does not disturb the running FC: its open fds, cwd, and
+    ///   the bound unix socket follow the inode),
+    /// * the in-memory maps (record, process, console capture, composed
+    ///   jail, UFFD handler).
+    ///
+    /// Snapshots taken from the VM move with it: after the rename they are
+    /// addressed as `SnapshotRef { vm_id: new_vm_id, .. }`.
+    ///
+    /// Refused for VMs with composed network/vsock/firewall attachments —
+    /// those managers key host resources (TAP, CID, iptables chain) by vm id
+    /// and have no rename surface. Warm-pool restores never compose them
+    /// (restores swap network via `SnapshotRef::network_overrides`).
+    ///
+    /// Known residue: a jailed FC process stays in the cgroup named after the
+    /// old id; cgroup cleanup was already best-effort on teardown, and the
+    /// empty leaf is removable once the process exits.
+    fn rename_vm(&self, old_vm_id: &str, new_vm_id: &str) -> VmRuntimeResult<()> {
+        if old_vm_id == new_vm_id {
+            return Ok(());
+        }
+
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| VmRuntimeError::StatePoisoned)?;
+        if state.contains_key(new_vm_id) {
+            return Err(VmRuntimeError::VmAlreadyExists(new_vm_id.to_owned()));
+        }
+        let record = state
+            .get(old_vm_id)
+            .ok_or_else(|| VmRuntimeError::VmNotFound(old_vm_id.to_owned()))?;
+        if record.status == VmStatus::Destroyed {
+            return Err(VmRuntimeError::InvalidTransition {
+                vm_id: old_vm_id.to_owned(),
+                from: VmStatus::Destroyed.to_string(),
+                to: "renamed",
+            });
+        }
+
+        let mut composed = self
+            .composed
+            .lock()
+            .map_err(|_| VmRuntimeError::StatePoisoned)?;
+        let jail = match composed.get(old_vm_id) {
+            Some(a) if a.network_attached || a.vsock_attached || a.firewall_installed => {
+                return Err(VmRuntimeError::Unsupported(format!(
+                    "rename_vm('{old_vm_id}' -> '{new_vm_id}'): composed network/vsock/\
+                     firewall attachments are keyed by vm id in their host managers and \
+                     cannot be re-keyed; warm-pool restores never compose these"
+                )));
+            }
+            Some(a) => a.jail.clone(),
+            None => None,
+        };
+
+        // Plan the socket-holder move before touching the filesystem so a
+        // failure leaves everything in place.
+        let old_state_dir = record.state_dir.clone();
+        let new_state_dir = self.vm_state_path(new_vm_id);
+        let socket_name = record.socket_path.file_name().ok_or_else(|| {
+            VmRuntimeError::Unsupported(format!(
+                "invalid api socket path for vm {old_vm_id}: {}",
+                record.socket_path.display()
+            ))
+        })?;
+        let (old_holder, new_holder, new_socket_path, new_jail) = match jail.as_ref() {
+            Some(jail) => {
+                // The jailer lays out `<base>/firecracker/<id>/root/`; the vm
+                // dir (chroot parent) is the unit that carries the id.
+                let old_vm_dir = jail.chroot_path.parent().ok_or_else(|| {
+                    VmRuntimeError::Jailer(format!(
+                        "jail chroot {} has no parent vm dir",
+                        jail.chroot_path.display()
+                    ))
+                })?;
+                let new_vm_dir = old_vm_dir
+                    .parent()
+                    .ok_or_else(|| {
+                        VmRuntimeError::Jailer(format!(
+                            "jail vm dir {} has no firecracker base dir",
+                            old_vm_dir.display()
+                        ))
+                    })?
+                    .join(jailer::safe_vm_id(new_vm_id));
+                let new_chroot = new_vm_dir.join("root");
+                let new_socket = new_chroot.join(socket_name);
+                let renamed_jail = VmJail {
+                    chroot_path: new_chroot,
+                    api_socket_in_chroot: jail.api_socket_in_chroot.clone(),
+                    api_socket_on_host: new_socket.clone(),
+                };
+                (
+                    old_vm_dir.to_path_buf(),
+                    new_vm_dir,
+                    new_socket,
+                    Some(renamed_jail),
+                )
+            }
+            None => {
+                let old_socket_dir = self.config.socket_dir.join(self.safe_vm_id(old_vm_id));
+                let new_socket_dir = self.config.socket_dir.join(self.safe_vm_id(new_vm_id));
+                let new_socket = new_socket_dir.join(socket_name);
+                (old_socket_dir, new_socket_dir, new_socket, None)
+            }
+        };
+
+        fs::rename(&old_state_dir, &new_state_dir).map_err(|e| {
+            VmRuntimeError::Unsupported(format!(
+                "rename_vm: failed moving state dir {} -> {}: {e}",
+                old_state_dir.display(),
+                new_state_dir.display()
+            ))
+        })?;
+        if let Err(e) = fs::rename(&old_holder, &new_holder) {
+            // Restore the state dir so the VM stays addressable by the old id.
+            let rollback = fs::rename(&new_state_dir, &old_state_dir);
+            return Err(VmRuntimeError::Unsupported(format!(
+                "rename_vm: failed moving {} -> {}: {e} (state dir rollback: {})",
+                old_holder.display(),
+                new_holder.display(),
+                match rollback {
+                    Ok(()) => "ok".to_owned(),
+                    Err(re) => format!("FAILED: {re}"),
+                }
+            )));
+        }
+
+        // Filesystem is consistent under the new id — re-key the maps. These
+        // are infallible aside from lock poisoning, which is fatal anyway.
+        let mut record = state
+            .remove(old_vm_id)
+            .expect("checked above while holding the state write lock");
+        record.state_dir = new_state_dir;
+        record.socket_path = new_socket_path;
+        state.insert(new_vm_id.to_owned(), record);
+
+        if let Some(mut attachments) = composed.remove(old_vm_id) {
+            attachments.jail = new_jail;
+            composed.insert(new_vm_id.to_owned(), attachments);
+        }
+        {
+            let mut processes = self
+                .processes
+                .lock()
+                .map_err(|_| VmRuntimeError::StatePoisoned)?;
+            if let Some(child) = processes.remove(old_vm_id) {
+                processes.insert(new_vm_id.to_owned(), child);
+            }
+        }
+        if let Ok(mut consoles) = self.consoles.lock()
+            && let Some(capture) = consoles.remove(old_vm_id)
+        {
+            consoles.insert(new_vm_id.to_owned(), capture);
+        }
+        if let Ok(mut handlers) = self.uffd_handlers.lock()
+            && let Some(handler) = handlers.remove(old_vm_id)
+        {
+            handlers.insert(new_vm_id.to_owned(), handler);
+        }
+
         Ok(())
     }
 }
@@ -1136,7 +1711,574 @@ fn token_bucket_to_json(bucket: &TokenBucket) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::composer::FirecrackerComposer;
+    use crate::jailer::{Jailer, JailerConfig};
     use crate::model::{RateLimiter, TokenBucket};
+
+    fn test_config(root: &Path) -> FirecrackerConfig {
+        FirecrackerConfig {
+            binary_path: PathBuf::from("/usr/local/bin/firecracker"),
+            kernel_path: root.join("vmlinux"),
+            rootfs_path: root.join("rootfs.ext4"),
+            boot_args: DEFAULT_BOOT_ARGS.to_string(),
+            socket_dir: root.join("sockets"),
+            state_dir: root.join("state"),
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            rootfs_read_only: true,
+            api_timeout: Duration::from_millis(200),
+            socket_ready_timeout: Duration::from_millis(200),
+            mem_backend: MemBackend::File,
+        }
+    }
+
+    /// Provider with one live VM inserted directly (no FC process): state
+    /// dir with a `warm` snapshot, socket dir with a stand-in socket file.
+    fn seeded_provider(root: &Path, vm_id: &str, status: VmStatus) -> FirecrackerVmProvider {
+        let provider = FirecrackerVmProvider::new(test_config(root));
+        let state_dir = provider.vm_state_path(vm_id);
+        let snap_dir = state_dir.join("snapshots");
+        fs::create_dir_all(&snap_dir).unwrap();
+        fs::write(snap_dir.join("warm.vmstate"), b"vmstate").unwrap();
+        fs::write(snap_dir.join("warm.mem"), b"guest memory").unwrap();
+        let socket_dir = provider.config.socket_dir.join(provider.safe_vm_id(vm_id));
+        fs::create_dir_all(&socket_dir).unwrap();
+        let socket_path = socket_dir.join("api.sock");
+        fs::write(&socket_path, b"").unwrap();
+        provider.state.write().unwrap().insert(
+            vm_id.to_owned(),
+            VmRecord {
+                status,
+                snapshots: vec!["warm".to_owned()],
+                socket_path,
+                state_dir,
+            },
+        );
+        provider
+    }
+
+    fn same_inode(a: &Path, b: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let (ma, mb) = (fs::metadata(a).unwrap(), fs::metadata(b).unwrap());
+        ma.dev() == mb.dev() && ma.ino() == mb.ino()
+    }
+
+    // ---- MemBackend option surface ----
+
+    #[test]
+    fn mem_backend_parses_file_and_uffd_case_insensitive() {
+        assert_eq!("file".parse::<MemBackend>().unwrap(), MemBackend::File);
+        assert_eq!("File".parse::<MemBackend>().unwrap(), MemBackend::File);
+        assert_eq!("uffd".parse::<MemBackend>().unwrap(), MemBackend::Uffd);
+        assert_eq!(" UFFD ".parse::<MemBackend>().unwrap(), MemBackend::Uffd);
+        assert!("mmap".parse::<MemBackend>().is_err());
+    }
+
+    #[test]
+    fn mem_backend_env_absent_defaults_to_file() {
+        assert_eq!(mem_backend_from_env_value(None), MemBackend::File);
+        assert_eq!(mem_backend_from_env_value(Some("uffd")), MemBackend::Uffd);
+    }
+
+    #[test]
+    #[should_panic(expected = "MICROVM_MEM_BACKEND")]
+    fn mem_backend_env_invalid_value_fails_loud() {
+        mem_backend_from_env_value(Some("filee"));
+    }
+
+    // ---- Snapshot artifact path model ----
+
+    #[test]
+    fn snapshot_paths_non_jailed_coincide_with_durable() {
+        let snap_dir = Path::new("/var/state/vm-1/snapshots");
+        let p = snapshot_artifact_paths(snap_dir, "warm", None).unwrap();
+        assert_eq!(p.durable_vmstate, snap_dir.join("warm.vmstate"));
+        assert_eq!(p.durable_mem, snap_dir.join("warm.mem"));
+        assert_eq!(p.fc_vmstate, p.durable_vmstate);
+        assert_eq!(p.fc_mem, p.durable_mem);
+        assert_eq!(p.staged_vmstate, p.durable_vmstate);
+        assert!(!p.is_staged());
+    }
+
+    #[test]
+    fn snapshot_paths_jailed_reference_chroot_relative() {
+        let snap_dir = Path::new("/var/state/vm-1/snapshots");
+        let chroot = Path::new("/srv/jailer/firecracker/vm-1/root");
+        let p = snapshot_artifact_paths(snap_dir, "warm", Some(chroot)).unwrap();
+        // The FC API body must get in-chroot absolute paths…
+        assert_eq!(p.fc_vmstate, PathBuf::from("/warm.vmstate"));
+        assert_eq!(p.fc_mem, PathBuf::from("/warm.mem"));
+        // …which live at <chroot>/<name> from the host's view…
+        assert_eq!(p.staged_vmstate, chroot.join("warm.vmstate"));
+        assert_eq!(p.staged_mem, chroot.join("warm.mem"));
+        // …while the durable home stays in the state dir.
+        assert_eq!(p.durable_vmstate, snap_dir.join("warm.vmstate"));
+        assert!(p.is_staged());
+    }
+
+    #[test]
+    fn snapshot_paths_reject_unsafe_ids() {
+        let snap_dir = Path::new("/var/state/vm-1/snapshots");
+        for bad in ["../warm", "a/b", "", "a..b", "wa rm", "warm\0"] {
+            let err = snapshot_artifact_paths(snap_dir, bad, None).unwrap_err();
+            assert!(
+                matches!(err, VmRuntimeError::Unsupported(_)),
+                "id {bad:?} must be rejected"
+            );
+        }
+        assert!(snapshot_artifact_paths(snap_dir, "ok-1.v2_x", None).is_ok());
+    }
+
+    #[test]
+    fn move_into_place_renames_within_same_fs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("staged.mem");
+        let to = tmp.path().join("durable.mem");
+        fs::write(&from, b"pages").unwrap();
+        move_into_place(&from, &to).unwrap();
+        assert!(!from.exists());
+        assert_eq!(fs::read(&to).unwrap(), b"pages");
+    }
+
+    // ---- /snapshot/load body ----
+
+    fn snapshot_ref(resume: bool, overrides: Vec<NetworkInterface>) -> SnapshotRef {
+        SnapshotRef {
+            vm_id: "vm-src".into(),
+            snapshot_id: "warm".into(),
+            resume_immediately: resume,
+            network_overrides: overrides,
+        }
+    }
+
+    #[test]
+    fn load_body_file_backend_shape() {
+        let body = build_snapshot_load_body(
+            &snapshot_ref(true, vec![]),
+            Path::new("/warm.vmstate"),
+            serde_json::json!({ "backend_type": "File", "backend_path": "/warm.mem" }),
+        );
+        assert_eq!(body["snapshot_path"], "/warm.vmstate");
+        assert_eq!(body["mem_backend"]["backend_type"], "File");
+        assert_eq!(body["mem_backend"]["backend_path"], "/warm.mem");
+        assert_eq!(body["resume_vm"], true);
+        assert_eq!(body["enable_diff_snapshots"], false);
+        assert!(body.get("network_interfaces").is_none());
+    }
+
+    #[test]
+    fn load_body_uffd_backend_shape() {
+        let body = build_snapshot_load_body(
+            &snapshot_ref(false, vec![]),
+            Path::new("/warm.vmstate"),
+            crate::uffd::snapshot_load_mem_backend_uffd(Path::new("/uffd.sock")),
+        );
+        assert_eq!(body["mem_backend"]["backend_type"], "Uffd");
+        assert_eq!(body["mem_backend"]["backend_path"], "/uffd.sock");
+        assert_eq!(body["resume_vm"], false);
+    }
+
+    #[test]
+    fn load_body_includes_network_overrides() {
+        let overrides = vec![NetworkInterface {
+            iface_id: "eth0".into(),
+            host_dev_name: "tap-new".into(),
+            guest_mac: Some("AA:BB:CC:DD:EE:FF".into()),
+            rx_rate_limiter: None,
+            tx_rate_limiter: None,
+        }];
+        let body = build_snapshot_load_body(
+            &snapshot_ref(true, overrides),
+            Path::new("/warm.vmstate"),
+            serde_json::json!({ "backend_type": "File", "backend_path": "/warm.mem" }),
+        );
+        let ifaces = body["network_interfaces"].as_array().unwrap();
+        assert_eq!(ifaces.len(), 1);
+        assert_eq!(ifaces[0]["host_dev_name"], "tap-new");
+        assert_eq!(ifaces[0]["guest_mac"], "AA:BB:CC:DD:EE:FF");
+    }
+
+    // ---- Jail-aware restore staging (the 0.4.0-alpha.1 ENOENT bug) ----
+
+    /// The named bug: `load_snapshot` handed a jailed FC host-absolute
+    /// snapshot paths, which ENOENT inside the chroot. The fix stages the
+    /// durable artifacts into the chroot before the API call. The FC request
+    /// itself fails here (no live FC socket), but staging happens first — so
+    /// reverting the fix turns the staged-file assertions red.
+    #[test]
+    fn jailed_restore_stages_snapshot_into_chroot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = FirecrackerVmProvider::new(test_config(tmp.path())).with_composer(
+            FirecrackerComposer {
+                jailer: Some(Arc::new(Jailer::new(JailerConfig {
+                    chroot_base: tmp.path().join("jail"),
+                    ..JailerConfig::default()
+                }))),
+                ..FirecrackerComposer::bare()
+            },
+        );
+        let snap_dir = provider.vm_state_path("vm-src").join("snapshots");
+        fs::create_dir_all(&snap_dir).unwrap();
+        fs::write(snap_dir.join("warm.vmstate"), b"vmstate").unwrap();
+        fs::write(snap_dir.join("warm.mem"), b"guest memory").unwrap();
+
+        let chroot = tmp.path().join("jail/firecracker/vm-new/root");
+        fs::create_dir_all(&chroot).unwrap();
+        let jail = VmJail {
+            chroot_path: chroot.clone(),
+            api_socket_in_chroot: PathBuf::from("/api.sock"),
+            api_socket_on_host: chroot.join("api.sock"),
+        };
+
+        let err = provider
+            .load_snapshot(
+                &jail.api_socket_on_host,
+                &snapshot_ref(true, vec![]),
+                "vm-new",
+                Some(&jail),
+            )
+            .expect_err("no live FC socket — the API call must fail");
+        // Failure must be the socket connect, not a path problem.
+        assert!(
+            matches!(&err, VmRuntimeError::Unsupported(msg) if msg.contains("failed connecting")),
+            "unexpected error: {err}"
+        );
+
+        // The artifacts were staged into the chroot as hard links before the
+        // call, exactly where the chroot-relative body paths resolve to.
+        assert!(same_inode(
+            &snap_dir.join("warm.vmstate"),
+            &chroot.join("warm.vmstate")
+        ));
+        assert!(same_inode(
+            &snap_dir.join("warm.mem"),
+            &chroot.join("warm.mem")
+        ));
+    }
+
+    #[test]
+    fn restore_missing_mem_file_is_snapshot_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = FirecrackerVmProvider::new(test_config(tmp.path()));
+        let snap_dir = provider.vm_state_path("vm-src").join("snapshots");
+        fs::create_dir_all(&snap_dir).unwrap();
+        fs::write(snap_dir.join("warm.vmstate"), b"vmstate").unwrap();
+        // No warm.mem — must fail as a typed missing-snapshot, not surface
+        // later as an opaque FC-side ENOENT.
+        let err = provider
+            .load_snapshot(
+                Path::new("/nonexistent.sock"),
+                &snapshot_ref(true, vec![]),
+                "vm-new",
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, VmRuntimeError::SnapshotNotFound { .. }));
+    }
+
+    /// Jailed snapshot create tells FC to write in-chroot; when the API call
+    /// fails, any partial staged artifacts must be cleaned out of the chroot.
+    #[test]
+    fn jailed_snapshot_create_cleans_staged_partials_on_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = FirecrackerVmProvider::new(test_config(tmp.path()));
+        let state_dir = provider.vm_state_path("vm-1");
+        fs::create_dir_all(&state_dir).unwrap();
+        let chroot = tmp.path().join("jail/firecracker/vm-1/root");
+        fs::create_dir_all(&chroot).unwrap();
+        // Partial artifacts as if FC wrote them before dying.
+        fs::write(chroot.join("warm.vmstate"), b"partial").unwrap();
+        fs::write(chroot.join("warm.mem"), b"partial").unwrap();
+        let jail = VmJail {
+            chroot_path: chroot.clone(),
+            api_socket_in_chroot: PathBuf::from("/api.sock"),
+            api_socket_on_host: chroot.join("api.sock"),
+        };
+
+        provider
+            .create_snapshot(&jail.api_socket_on_host, &state_dir, "warm", Some(&jail))
+            .expect_err("no live FC socket — must fail");
+
+        assert!(!chroot.join("warm.vmstate").exists());
+        assert!(!chroot.join("warm.mem").exists());
+        assert!(!state_dir.join("snapshots/warm.vmstate").exists());
+    }
+
+    /// Non-jailed UFFD restore: the handler socket is created in the target
+    /// VM's state dir for the API call and torn down (drop = shutdown) when
+    /// the restore fails.
+    #[test]
+    fn uffd_restore_failure_tears_down_handler_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = test_config(tmp.path());
+        config.mem_backend = MemBackend::Uffd;
+        let provider = FirecrackerVmProvider::new(config);
+        let snap_dir = provider.vm_state_path("vm-src").join("snapshots");
+        fs::create_dir_all(&snap_dir).unwrap();
+        fs::write(snap_dir.join("warm.vmstate"), b"vmstate").unwrap();
+        fs::write(snap_dir.join("warm.mem"), b"guest memory").unwrap();
+        fs::create_dir_all(provider.vm_state_path("vm-new")).unwrap();
+
+        let err = provider
+            .load_snapshot(
+                Path::new("/nonexistent.sock"),
+                &snapshot_ref(true, vec![]),
+                "vm-new",
+                None,
+            )
+            .expect_err("no live FC socket — the API call must fail");
+        assert!(
+            matches!(&err, VmRuntimeError::Unsupported(msg) if msg.contains("failed connecting")),
+            "unexpected error: {err}"
+        );
+        // The handler was dropped on failure and removed its socket.
+        assert!(
+            !provider
+                .vm_state_path("vm-new")
+                .join(UFFD_SOCKET_BASENAME)
+                .exists()
+        );
+    }
+
+    // ---- rename_vm (warm-pool handoff) ----
+
+    #[test]
+    fn rename_moves_state_and_socket_dirs_and_rekeys_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = seeded_provider(tmp.path(), "pool-1", VmStatus::Running);
+
+        provider.rename_vm("pool-1", "sandbox-9").expect("rename");
+
+        // Old identity fully gone…
+        assert!(provider.get_vm("pool-1").unwrap().is_none());
+        assert!(!provider.vm_state_path("pool-1").exists());
+        assert!(!tmp.path().join("sockets/pool-1").exists());
+        // …new identity fully addressable, snapshots moved with the VM.
+        let view = provider.get_vm("sandbox-9").unwrap().expect("renamed vm");
+        assert_eq!(view.status, VmStatus::Running);
+        assert_eq!(view.snapshots, vec!["warm".to_owned()]);
+        let new_state_dir = provider.vm_state_path("sandbox-9");
+        assert!(new_state_dir.join("snapshots/warm.vmstate").exists());
+        let record = provider.state.read().unwrap();
+        let record = record.get("sandbox-9").unwrap();
+        assert_eq!(record.state_dir, new_state_dir);
+        assert_eq!(
+            record.socket_path,
+            tmp.path().join("sockets/sandbox-9/api.sock")
+        );
+        assert!(record.socket_path.exists());
+    }
+
+    #[test]
+    fn rename_rejects_unknown_missing_and_duplicate_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = seeded_provider(tmp.path(), "pool-1", VmStatus::Running);
+
+        assert!(matches!(
+            provider.rename_vm("ghost", "x").unwrap_err(),
+            VmRuntimeError::VmNotFound(_)
+        ));
+
+        let state_dir = provider.vm_state_path("other");
+        fs::create_dir_all(&state_dir).unwrap();
+        provider.state.write().unwrap().insert(
+            "other".into(),
+            VmRecord {
+                status: VmStatus::Running,
+                snapshots: vec![],
+                socket_path: tmp.path().join("sockets/other/api.sock"),
+                state_dir,
+            },
+        );
+        assert!(matches!(
+            provider.rename_vm("pool-1", "other").unwrap_err(),
+            VmRuntimeError::VmAlreadyExists(_)
+        ));
+    }
+
+    #[test]
+    fn rename_rejects_destroyed_vm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = seeded_provider(tmp.path(), "pool-1", VmStatus::Destroyed);
+        assert!(matches!(
+            provider.rename_vm("pool-1", "sandbox-9").unwrap_err(),
+            VmRuntimeError::InvalidTransition { to: "renamed", .. }
+        ));
+    }
+
+    #[test]
+    fn rename_to_same_id_is_a_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = seeded_provider(tmp.path(), "pool-1", VmStatus::Running);
+        provider.rename_vm("pool-1", "pool-1").expect("noop");
+        assert!(provider.get_vm("pool-1").unwrap().is_some());
+    }
+
+    #[test]
+    fn rename_refuses_composed_network_attachments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = seeded_provider(tmp.path(), "pool-1", VmStatus::Running);
+        provider.composed.lock().unwrap().insert(
+            "pool-1".into(),
+            ComposedAttachments {
+                network_attached: true,
+                ..ComposedAttachments::default()
+            },
+        );
+        let err = provider.rename_vm("pool-1", "sandbox-9").unwrap_err();
+        assert!(matches!(err, VmRuntimeError::Unsupported(_)), "{err}");
+        // Nothing moved.
+        assert!(provider.get_vm("pool-1").unwrap().is_some());
+        assert!(provider.vm_state_path("pool-1").exists());
+    }
+
+    #[test]
+    fn rename_rekeys_jailed_chroot_and_jail_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = seeded_provider(tmp.path(), "pool-1", VmStatus::Running);
+        let old_chroot = tmp.path().join("jail/firecracker/pool-1/root");
+        fs::create_dir_all(&old_chroot).unwrap();
+        let socket_path = old_chroot.join("api.sock");
+        fs::write(&socket_path, b"").unwrap();
+        provider
+            .state
+            .write()
+            .unwrap()
+            .get_mut("pool-1")
+            .unwrap()
+            .socket_path = socket_path;
+        provider.composed.lock().unwrap().insert(
+            "pool-1".into(),
+            ComposedAttachments {
+                jail: Some(VmJail {
+                    chroot_path: old_chroot.clone(),
+                    api_socket_in_chroot: PathBuf::from("/api.sock"),
+                    api_socket_on_host: old_chroot.join("api.sock"),
+                }),
+                ..ComposedAttachments::default()
+            },
+        );
+
+        provider.rename_vm("pool-1", "sandbox-9").expect("rename");
+
+        let new_chroot = tmp.path().join("jail/firecracker/sandbox-9/root");
+        assert!(!tmp.path().join("jail/firecracker/pool-1").exists());
+        assert!(new_chroot.join("api.sock").exists());
+        let composed = provider.composed.lock().unwrap();
+        assert!(composed.get("pool-1").is_none());
+        let jail = composed.get("sandbox-9").unwrap().jail.as_ref().unwrap();
+        assert_eq!(jail.chroot_path, new_chroot);
+        assert_eq!(jail.api_socket_on_host, new_chroot.join("api.sock"));
+        assert_eq!(jail.api_socket_in_chroot, PathBuf::from("/api.sock"));
+        let state = provider.state.read().unwrap();
+        assert_eq!(
+            state.get("sandbox-9").unwrap().socket_path,
+            new_chroot.join("api.sock")
+        );
+    }
+
+    #[test]
+    fn rename_rolls_back_state_dir_when_socket_move_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = seeded_provider(tmp.path(), "pool-1", VmStatus::Running);
+        // Sabotage the socket-holder move: the socket dir is gone.
+        fs::remove_dir_all(tmp.path().join("sockets/pool-1")).unwrap();
+
+        let err = provider.rename_vm("pool-1", "sandbox-9").unwrap_err();
+        assert!(matches!(err, VmRuntimeError::Unsupported(_)), "{err}");
+        // The state dir was rolled back — the VM is still addressable under
+        // the old id and untouched under the new one.
+        assert!(provider.vm_state_path("pool-1").exists());
+        assert!(!provider.vm_state_path("sandbox-9").exists());
+        assert!(provider.get_vm("pool-1").unwrap().is_some());
+        assert!(provider.get_vm("sandbox-9").unwrap().is_none());
+    }
+
+    // ---- Jail-aware cold-boot config ----
+
+    /// Composed vsock + jailer is refused up front: the UDS path cannot
+    /// resolve both inside the chroot (for FC) and on the host (for clients).
+    #[test]
+    fn configure_vm_refuses_vsock_under_jailer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = FirecrackerVmProvider::new(test_config(tmp.path()));
+        let chroot = tmp.path().join("jail/firecracker/vm-1/root");
+        let jail = VmJail {
+            chroot_path: chroot.clone(),
+            api_socket_in_chroot: PathBuf::from("/api.sock"),
+            api_socket_on_host: chroot.join("api.sock"),
+        };
+        let spec = VmSpec {
+            vsock: Some(VsockSpec {
+                cid: 3,
+                uds_path: tmp.path().join("vsock.sock"),
+            }),
+            ..VmSpec::default()
+        };
+        // Refusal happens before any FC API call — no live socket needed.
+        let err = provider
+            .configure_vm(Path::new("/nonexistent.sock"), &spec, Some(&jail))
+            .unwrap_err();
+        assert!(
+            matches!(&err, VmRuntimeError::Unsupported(msg) if msg.contains("vsock under the jailer")),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Full jailed cold-boot → snapshot → restore → rename cycle against a
+    /// real Firecracker + jailer. Not run in CI (needs root + /dev/kvm).
+    ///
+    /// ```sh
+    /// sudo -E \
+    ///   MICROVM_FIRECRACKER_BIN=/usr/local/bin/firecracker \
+    ///   MICROVM_JAILER_BIN=/usr/local/bin/jailer \
+    ///   MICROVM_FIRECRACKER_KERNEL=/var/lib/firecracker/vmlinux \
+    ///   MICROVM_FIRECRACKER_ROOTFS=/var/lib/firecracker/rootfs/default.ext4 \
+    ///   cargo test --features firecracker -- --ignored jailed_snapshot_restore
+    /// ```
+    #[test]
+    #[ignore = "requires root, /dev/kvm, firecracker + jailer binaries, kernel + rootfs images"]
+    fn jailed_snapshot_restore_and_rename_e2e() {
+        let provider = FirecrackerVmProvider::from_env().with_composer(FirecrackerComposer {
+            jailer: Some(Arc::new(Jailer::from_env())),
+            ..FirecrackerComposer::bare()
+        });
+
+        provider.create_vm("e2e-src").expect("jailed cold boot");
+        provider.start_vm("e2e-src").expect("start");
+        thread::sleep(Duration::from_secs(2));
+        provider.stop_vm("e2e-src").expect("pause");
+        provider
+            .snapshot_vm("e2e-src", "warm")
+            .expect("snapshot written in-chroot then moved to the durable dir");
+        let snap_dir = provider.vm_state_path("e2e-src").join("snapshots");
+        assert!(snap_dir.join("warm.vmstate").exists());
+        assert!(snap_dir.join("warm.mem").exists());
+
+        // Restore while the source's state dir (the durable snapshot home)
+        // still exists — destroy_vm deletes it.
+        let spec = VmSpec {
+            restore_from: Some(SnapshotRef {
+                vm_id: "e2e-src".into(),
+                snapshot_id: "warm".into(),
+                resume_immediately: true,
+                network_overrides: vec![],
+            }),
+            ..VmSpec::default()
+        };
+        provider
+            .create_vm_with_spec("e2e-pool", &spec)
+            .expect("jailed restore from the durable snapshot");
+
+        provider
+            .rename_vm("e2e-pool", "e2e-claimed")
+            .expect("warm-pool handoff rename");
+        assert!(provider.get_vm("e2e-claimed").unwrap().is_some());
+        assert!(provider.get_vm("e2e-pool").unwrap().is_none());
+
+        provider.destroy_vm("e2e-claimed").expect("destroy renamed");
+        provider.destroy_vm("e2e-src").expect("destroy source");
+    }
 
     #[test]
     fn token_bucket_default_burst_equals_size() {

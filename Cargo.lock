@@ -308,7 +308,7 @@ version = "0.4.0-alpha.3"
 dependencies = [
  "base64",
  "libc",
- "nix 0.30.1",
+ "nix 0.31.3",
  "serde",
  "serde_json",
  "sha2",
@@ -337,9 +337,9 @@ dependencies = [
 
 [[package]]
 name = "nix"
-version = "0.30.1"
+version = "0.31.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
 dependencies = [
  "bitflags",
  "cfg-if",
@@ -636,6 +636,16 @@ dependencies = [
  "bindgen",
  "cc",
  "cfg-if",
+]
+
+[[package]]
+name = "vsock"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ba782755fc073877e567c2253c0be48e4aa9a254c232d36d3985dfae0bd5205"
+dependencies = [
+ "libc",
+ "nix 0.31.3",
 ]
 
 [[package]]

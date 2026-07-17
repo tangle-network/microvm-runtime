@@ -30,6 +30,23 @@ const DEFAULT_BOOT_ARGS: &str =
 const DEFAULT_API_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_SOCKET_READY_TIMEOUT_MS: u64 = 5_000;
 
+/// First sleep between API-socket readiness probes after spawning FC. The
+/// socket is usually ready within a few ms of exec, so the first re-check
+/// must come fast — a flat 100 ms poll wasted 50–90 ms of pure idle wait on
+/// every VM spawn.
+const SOCKET_POLL_INITIAL_INTERVAL: Duration = Duration::from_millis(2);
+/// Backoff cap for the readiness poll — the previous flat interval, so a
+/// genuinely slow host converges to exactly the old cadence instead of
+/// busy-spinning for the whole `socket_ready_timeout`.
+const SOCKET_POLL_MAX_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Next sleep in the socket-readiness backoff: double, capped at
+/// [`SOCKET_POLL_MAX_INTERVAL`]. From the initial 2 ms: 4, 8, 16, 32, 64,
+/// 100, 100, …
+fn next_socket_poll_interval(current: Duration) -> Duration {
+    (current * 2).min(SOCKET_POLL_MAX_INTERVAL)
+}
+
 /// Basename of the per-VM userfaultfd socket used when
 /// [`MemBackend::Uffd`] is selected. Jailed VMs get it at the chroot root
 /// (FC connects to `/uffd.sock` post-chroot); non-jailed VMs get it in the
@@ -831,6 +848,7 @@ impl FirecrackerVmProvider {
 
     fn wait_for_socket_ready(&self, socket_path: &Path) -> VmRuntimeResult<()> {
         let deadline = Instant::now() + self.config.socket_ready_timeout;
+        let mut interval = SOCKET_POLL_INITIAL_INTERVAL;
         while Instant::now() < deadline {
             if socket_path.exists()
                 && self
@@ -839,7 +857,8 @@ impl FirecrackerVmProvider {
             {
                 return Ok(());
             }
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(interval);
+            interval = next_socket_poll_interval(interval);
         }
         Err(VmRuntimeError::Unsupported(format!(
             "firecracker api socket not ready within {:?}: {}",
@@ -1989,6 +2008,26 @@ mod tests {
     #[should_panic(expected = "MICROVM_MEM_BACKEND")]
     fn mem_backend_env_invalid_value_fails_loud() {
         mem_backend_from_env_value(Some("filee"), false);
+    }
+
+    // ---- Socket-ready poll backoff ----
+
+    #[test]
+    fn socket_poll_backoff_doubles_then_caps_at_old_flat_interval() {
+        let mut interval = SOCKET_POLL_INITIAL_INTERVAL;
+        let mut schedule = vec![interval];
+        for _ in 0..8 {
+            interval = next_socket_poll_interval(interval);
+            schedule.push(interval);
+        }
+        let ms: Vec<u64> = schedule.iter().map(|d| d.as_millis() as u64).collect();
+        // 2,4,8,16,32,64 then pinned at the 100 ms cap (the old flat poll).
+        assert_eq!(ms, vec![2, 4, 8, 16, 32, 64, 100, 100, 100]);
+        // The cap is sticky: once reached the interval never moves again.
+        assert_eq!(
+            next_socket_poll_interval(SOCKET_POLL_MAX_INTERVAL),
+            SOCKET_POLL_MAX_INTERVAL
+        );
     }
 
     // ---- Snapshot artifact path model ----

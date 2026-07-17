@@ -61,7 +61,7 @@ provider.destroy_vm("vm-1")?;
 | `MICROVM_FIRECRACKER_STATE_DIR` | `/var/lib/microvm/state` | Per-VM state dir |
 | `MICROVM_FIRECRACKER_VCPU` | `1` | Default vCPU count |
 | `MICROVM_FIRECRACKER_MEM_MIB` | `256` | Default memory size |
-| `MICROVM_MEM_BACKEND` | `file` | Snapshot-restore memory backend: `file` (FC reads the whole mem file before resume) or `uffd` (userfaultfd handler pages memory in on demand) |
+| `MICROVM_MEM_BACKEND` | auto | Snapshot-restore memory backend: `file` (FC reads the whole mem file before resume) or `uffd` (userfaultfd handler pages memory in on demand). Unset, the config probes `/proc/sys/vm/unprivileged_userfaultfd`: `1` → `uffd`, else `file` with a warning. Set `uffd` explicitly if Firecracker runs with CAP_SYS_PTRACE on a host with the sysctl off. |
 
 ## License
 

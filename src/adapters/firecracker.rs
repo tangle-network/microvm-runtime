@@ -37,6 +37,12 @@ const DEFAULT_SOCKET_READY_TIMEOUT_MS: u64 = 5_000;
 const UFFD_SOCKET_BASENAME: &str = "uffd.sock";
 
 /// Guest-memory backend Firecracker uses on `PUT /snapshot/load`.
+///
+/// The `Default` impl is [`MemBackend::File`] — the always-works choice for
+/// programmatically constructed configs. [`FirecrackerConfig::from_env`]
+/// is smarter: with `MICROVM_MEM_BACKEND` unset it probes the host (see
+/// [`host_allows_unprivileged_uffd`]) and picks `Uffd` when the spawned
+/// Firecracker will be able to create a userfaultfd.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MemBackend {
     /// FC reads the whole snapshot mem file synchronously before resuming.
@@ -61,13 +67,53 @@ impl std::str::FromStr for MemBackend {
     }
 }
 
-/// Parse `MICROVM_MEM_BACKEND`. Absent → the `File` default; an invalid
+/// Sysctl gating `userfaultfd(2)` for processes without CAP_SYS_PTRACE.
+const UNPRIVILEGED_USERFAULTFD_SYSCTL: &str = "/proc/sys/vm/unprivileged_userfaultfd";
+
+/// Whether *any* process on this host — including a jailed, privilege-
+/// dropped Firecracker — can create a userfaultfd.
+///
+/// The userfaultfd behind [`MemBackend::Uffd`] is created by the
+/// **Firecracker process** (it hands the fd to our handler over the UDS),
+/// so probing our own process (a `userfaultfd(2)` attempt here) would
+/// over-approximate: this process may hold CAP_SYS_PTRACE while the jailed
+/// FC it spawns runs uid-dropped and fails at restore time. The
+/// `vm.unprivileged_userfaultfd=1` sysctl is the one signal valid for
+/// every FC we spawn. Hosts running FC privileged with the sysctl off can
+/// still opt in explicitly via `MICROVM_MEM_BACKEND=uffd`.
+///
+/// Missing file (kernel without CONFIG_USERFAULTFD, non-Linux) reads as
+/// unsupported — fail-safe to the File backend.
+fn host_allows_unprivileged_uffd() -> bool {
+    fs::read_to_string(UNPRIVILEGED_USERFAULTFD_SYSCTL)
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Parse `MICROVM_MEM_BACKEND`. An explicit value always wins; an invalid
 /// value panics rather than silently running with the wrong backend — a
 /// misconfigured operator must find out at startup, not on the first slow
 /// restore.
-fn mem_backend_from_env_value(value: Option<&str>) -> MemBackend {
+///
+/// Absent → auto-detect from `uffd_usable` (the
+/// [`host_allows_unprivileged_uffd`] probe, injected for testability):
+/// `Uffd` when the host allows it — restores resume in ~ms instead of
+/// reading the whole guest-RAM file — else `File` with a one-line warning
+/// naming the sysctl that would unlock the fast path.
+fn mem_backend_from_env_value(value: Option<&str>, uffd_usable: bool) -> MemBackend {
     match value {
-        None => MemBackend::default(),
+        None if uffd_usable => MemBackend::Uffd,
+        None => {
+            eprintln!(
+                "[microvm-firecracker] MICROVM_MEM_BACKEND unset and \
+                 {UNPRIVILEGED_USERFAULTFD_SYSCTL} != 1: using the File memory \
+                 backend (snapshot restore reads the entire guest-RAM file \
+                 before resume). Set vm.unprivileged_userfaultfd=1 — or \
+                 MICROVM_MEM_BACKEND=uffd if firecracker runs with \
+                 CAP_SYS_PTRACE — for lazy userfaultfd restores."
+            );
+            MemBackend::File
+        }
         Some(v) => v
             .parse::<MemBackend>()
             .unwrap_or_else(|e| panic!("MICROVM_MEM_BACKEND: {e}")),
@@ -203,8 +249,9 @@ pub struct FirecrackerConfig {
     /// Max wait for Firecracker API socket readiness after process spawn.
     pub socket_ready_timeout: Duration,
     /// Guest-memory backend for snapshot restore. `MICROVM_MEM_BACKEND`
-    /// accepts `file` (default) or `uffd`; an invalid value fails loudly at
-    /// config load.
+    /// accepts `file` or `uffd`; unset, [`Self::from_env`] auto-detects
+    /// (`uffd` when the host permits unprivileged userfaultfd, else `file`
+    /// with a warning); an invalid value fails loudly at config load.
     pub mem_backend: MemBackend,
 }
 
@@ -255,8 +302,10 @@ impl FirecrackerConfig {
                 .filter(|v| *v > 0)
                 .unwrap_or(DEFAULT_SOCKET_READY_TIMEOUT_MS),
         );
-        let mem_backend =
-            mem_backend_from_env_value(std::env::var("MICROVM_MEM_BACKEND").ok().as_deref());
+        let mem_backend = mem_backend_from_env_value(
+            std::env::var("MICROVM_MEM_BACKEND").ok().as_deref(),
+            host_allows_unprivileged_uffd(),
+        );
 
         Self {
             binary_path,
@@ -1907,15 +1956,39 @@ mod tests {
     }
 
     #[test]
-    fn mem_backend_env_absent_defaults_to_file() {
-        assert_eq!(mem_backend_from_env_value(None), MemBackend::File);
-        assert_eq!(mem_backend_from_env_value(Some("uffd")), MemBackend::Uffd);
+    fn mem_backend_env_absent_resolves_from_uffd_probe() {
+        // Probe says the host allows unprivileged userfaultfd → lazy restore.
+        assert_eq!(mem_backend_from_env_value(None, true), MemBackend::Uffd);
+        // Probe says no → fail-safe to File (with a warning on stderr).
+        assert_eq!(mem_backend_from_env_value(None, false), MemBackend::File);
+    }
+
+    #[test]
+    fn mem_backend_env_explicit_value_beats_probe() {
+        // Operator forces uffd on a host the probe rejected (e.g. FC runs
+        // with CAP_SYS_PTRACE and the sysctl is off).
+        assert_eq!(
+            mem_backend_from_env_value(Some("uffd"), false),
+            MemBackend::Uffd
+        );
+        // Operator forces file even though the host could do uffd.
+        assert_eq!(
+            mem_backend_from_env_value(Some("file"), true),
+            MemBackend::File
+        );
+    }
+
+    #[test]
+    fn mem_backend_default_stays_file_for_programmatic_configs() {
+        // `Default` must not probe — a hand-built config keeps the
+        // always-works backend unless the caller opts in.
+        assert_eq!(MemBackend::default(), MemBackend::File);
     }
 
     #[test]
     #[should_panic(expected = "MICROVM_MEM_BACKEND")]
     fn mem_backend_env_invalid_value_fails_loud() {
-        mem_backend_from_env_value(Some("filee"));
+        mem_backend_from_env_value(Some("filee"), false);
     }
 
     // ---- Snapshot artifact path model ----

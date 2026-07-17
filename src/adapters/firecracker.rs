@@ -446,6 +446,27 @@ fn move_into_place(from: &Path, to: &Path) -> VmRuntimeResult<()> {
     }
 }
 
+/// Build the `PUT /machine-config` body.
+///
+/// `track_dirty_pages` defaults to **off**: it exists solely to feed diff
+/// snapshots, and this adapter only ever issues `snapshot_type: "Full"`
+/// creates and `enable_diff_snapshots: false` loads — so the kernel
+/// dirty-page bitmap would tax every guest write with no consumer. Set
+/// [`crate::model::VmSpec::track_dirty_pages`] to `Some(true)` per-VM when
+/// diff snapshots are driven externally.
+fn machine_config_body(
+    vcpu_count: u8,
+    mem_size_mib: u32,
+    track_dirty_pages: Option<bool>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "vcpu_count": vcpu_count,
+        "mem_size_mib": mem_size_mib,
+        "smt": false,
+        "track_dirty_pages": track_dirty_pages.unwrap_or(false)
+    })
+}
+
 /// Build the `PUT /snapshot/load` body. `mem_backend` is either the `File`
 /// object pointing at the FC-visible mem path or the `Uffd` object pointing
 /// at the FC-visible handler socket (see
@@ -891,13 +912,7 @@ impl FirecrackerVmProvider {
 
         let vcpu_count = spec.vcpu_count.unwrap_or(self.config.vcpu_count);
         let mem_size_mib = spec.mem_size_mib.unwrap_or(self.config.mem_size_mib);
-        let track_dirty_pages = spec.track_dirty_pages.unwrap_or(true);
-        let machine = serde_json::json!({
-            "vcpu_count": vcpu_count,
-            "mem_size_mib": mem_size_mib,
-            "smt": false,
-            "track_dirty_pages": track_dirty_pages
-        });
+        let machine = machine_config_body(vcpu_count, mem_size_mib, spec.track_dirty_pages);
         self.firecracker_request(socket_path, "PUT", "/machine-config", Some(machine))?;
 
         // A jailed FC resolves every path inside its chroot, where the jailer
@@ -2082,6 +2097,31 @@ mod tests {
         move_into_place(&from, &to).unwrap();
         assert!(!from.exists());
         assert_eq!(fs::read(&to).unwrap(), b"pages");
+    }
+
+    // ---- /machine-config body ----
+
+    #[test]
+    fn machine_config_defaults_track_dirty_pages_off() {
+        // No consumer exists for the dirty bitmap (Full snapshots only), so
+        // the unset spec must not pay for it.
+        let body = machine_config_body(2, 512, None);
+        assert_eq!(body["vcpu_count"], 2);
+        assert_eq!(body["mem_size_mib"], 512);
+        assert_eq!(body["smt"], false);
+        assert_eq!(body["track_dirty_pages"], false);
+    }
+
+    #[test]
+    fn machine_config_track_dirty_pages_stays_settable() {
+        assert_eq!(
+            machine_config_body(1, 128, Some(true))["track_dirty_pages"],
+            true
+        );
+        assert_eq!(
+            machine_config_body(1, 128, Some(false))["track_dirty_pages"],
+            false
+        );
     }
 
     // ---- /snapshot/load body ----

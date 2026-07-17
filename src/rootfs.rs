@@ -77,7 +77,7 @@ use std::fs;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
@@ -725,12 +725,30 @@ enum CloneMode {
     Independent,
 }
 
-fn clone_file_with_mode(source: &Path, dest: &Path, mode: CloneMode) -> VmRuntimeResult<()> {
+/// Which rung of the reflink → hardlink → copy ladder a clone landed on.
+/// Surfaced so callers/tests can observe the effective clone cost — a
+/// `FullCopy` means every VM pays a whole-image byte copy.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum CloneStrategy {
+    Reflink,
+    Hardlink,
+    FullCopy,
+}
+
+/// One-shot latch for the full-copy warning: a fleet of VMs on a
+/// non-reflink filesystem would otherwise emit one line per clone.
+static FULL_COPY_WARNING: Once = Once::new();
+
+fn clone_file_with_mode(
+    source: &Path,
+    dest: &Path,
+    mode: CloneMode,
+) -> VmRuntimeResult<CloneStrategy> {
     // 1. Reflink (btrfs/XFS/bcachefs/ZFS-on-Linux). `cp --reflink=always`
     //    exits non-zero on filesystems that do not support FICLONE, so
     //    failure is the signal to fall through, not a hard error.
     if try_reflink(source, dest).is_ok() {
-        return Ok(());
+        return Ok(CloneStrategy::Reflink);
     }
     // Ensure the partial output from a failed reflink attempt is gone before
     // the next strategy runs — `cp` cleans up after itself, but defensively
@@ -743,10 +761,25 @@ fn clone_file_with_mode(source: &Path, dest: &Path, mode: CloneMode) -> VmRuntim
     //    through the shared inode.
     if mode == CloneMode::SharedOk {
         if fs::hard_link(source, dest).is_ok() {
-            return Ok(());
+            return Ok(CloneStrategy::Hardlink);
         }
         let _ = fs::remove_file(dest);
     }
+
+    // Landing here means every clone of a multi-GB rootfs is a full byte
+    // copy — operationally fine, but slow enough (seconds per VM) that it
+    // must not stay silent. Warn once per process; the remediation is a
+    // reflink-capable filesystem, not a code change.
+    FULL_COPY_WARNING.call_once(|| {
+        eprintln!(
+            "[microvm-rootfs] cloning {} by full byte copy: the filesystem \
+             supports no reflink (and hardlink sharing does not apply). Every \
+             VM clone copies the entire image; host the rootfs dirs on btrfs \
+             or XFS (reflink=1) for instant CoW clones. Warned once — later \
+             clones stay on this path silently.",
+            source.display()
+        );
+    });
 
     // 3. Full streaming copy. `fs::copy` uses `copy_file_range(2)` under the
     //    hood on Linux, which handles sparse files efficiently — same path
@@ -758,7 +791,7 @@ fn clone_file_with_mode(source: &Path, dest: &Path, mode: CloneMode) -> VmRuntim
             dest.display()
         ))
     })?;
-    Ok(())
+    Ok(CloneStrategy::FullCopy)
 }
 
 fn try_reflink(source: &Path, dest: &Path) -> std::io::Result<()> {
@@ -1267,6 +1300,38 @@ mod tests {
         assert_eq!(cfg.template_dir, PathBuf::from(DEFAULT_TEMPLATE_DIR));
         assert_eq!(cfg.clones_dir, PathBuf::from(DEFAULT_CLONES_DIR));
         assert_eq!(cfg.resize2fs_bin, PathBuf::from(DEFAULT_RESIZE2FS_BIN));
+    }
+
+    // ===================================================== clone strategy ====
+
+    #[test]
+    fn shared_clone_never_lands_on_full_copy_within_one_fs() {
+        // Source and dest share a tempdir (one filesystem), so even without
+        // reflink support the hardlink rung must catch a SharedOk clone —
+        // FullCopy here would mean the ladder is broken.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("template.ext4");
+        let dst = tmp.path().join("clone.ext4");
+        fs::write(&src, b"rootfs-bytes").unwrap();
+        let strategy = clone_file_with_mode(&src, &dst, CloneMode::SharedOk).unwrap();
+        assert_ne!(strategy, CloneStrategy::FullCopy, "got {strategy:?}");
+        assert_eq!(fs::read(&dst).unwrap(), b"rootfs-bytes");
+    }
+
+    #[test]
+    fn independent_clone_never_shares_the_source_inode() {
+        // Independent mode must skip the hardlink rung: it lands on reflink
+        // (new inode, CoW) or a full copy (new inode), never inode sharing.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("template.ext4");
+        let dst = tmp.path().join("clone.ext4");
+        fs::write(&src, b"rootfs-bytes").unwrap();
+        let strategy = clone_file_with_mode(&src, &dst, CloneMode::Independent).unwrap();
+        assert_ne!(strategy, CloneStrategy::Hardlink);
+        use std::os::unix::fs::MetadataExt;
+        let (s, d) = (fs::metadata(&src).unwrap(), fs::metadata(&dst).unwrap());
+        assert_ne!(s.ino(), d.ino(), "independent clone shares the inode");
+        assert_eq!(fs::read(&dst).unwrap(), b"rootfs-bytes");
     }
 
     // ============================================== clone_for_vm_with_size ====

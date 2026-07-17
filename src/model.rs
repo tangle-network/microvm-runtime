@@ -80,7 +80,10 @@ pub struct VmSpec {
     /// [`SnapshotRef::network_overrides`] to swap network interfaces on restore.
     pub restore_from: Option<SnapshotRef>,
     /// Track dirty pages during execution — required to later capture diff snapshots.
-    /// None = enabled (FC's safer default for snapshot-friendly workloads).
+    /// None = disabled: the runtime only takes Full snapshots, so the kernel's
+    /// dirty-page bitmap would cost a write-protect fault per touched page with
+    /// no consumer. Set `Some(true)` only if diff snapshots are driven against
+    /// the Firecracker API externally.
     pub track_dirty_pages: Option<bool>,
 }
 

@@ -30,6 +30,23 @@ const DEFAULT_BOOT_ARGS: &str =
 const DEFAULT_API_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_SOCKET_READY_TIMEOUT_MS: u64 = 5_000;
 
+/// First sleep between API-socket readiness probes after spawning FC. The
+/// socket is usually ready within a few ms of exec, so the first re-check
+/// must come fast — a flat 100 ms poll wasted 50–90 ms of pure idle wait on
+/// every VM spawn.
+const SOCKET_POLL_INITIAL_INTERVAL: Duration = Duration::from_millis(2);
+/// Backoff cap for the readiness poll — the previous flat interval, so a
+/// genuinely slow host converges to exactly the old cadence instead of
+/// busy-spinning for the whole `socket_ready_timeout`.
+const SOCKET_POLL_MAX_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Next sleep in the socket-readiness backoff: double, capped at
+/// [`SOCKET_POLL_MAX_INTERVAL`]. From the initial 2 ms: 4, 8, 16, 32, 64,
+/// 100, 100, …
+fn next_socket_poll_interval(current: Duration) -> Duration {
+    (current * 2).min(SOCKET_POLL_MAX_INTERVAL)
+}
+
 /// Basename of the per-VM userfaultfd socket used when
 /// [`MemBackend::Uffd`] is selected. Jailed VMs get it at the chroot root
 /// (FC connects to `/uffd.sock` post-chroot); non-jailed VMs get it in the
@@ -37,6 +54,12 @@ const DEFAULT_SOCKET_READY_TIMEOUT_MS: u64 = 5_000;
 const UFFD_SOCKET_BASENAME: &str = "uffd.sock";
 
 /// Guest-memory backend Firecracker uses on `PUT /snapshot/load`.
+///
+/// The `Default` impl is [`MemBackend::File`] — the always-works choice for
+/// programmatically constructed configs. [`FirecrackerConfig::from_env`]
+/// is smarter: with `MICROVM_MEM_BACKEND` unset it probes
+/// `/proc/sys/vm/unprivileged_userfaultfd` and picks `Uffd` when the
+/// spawned Firecracker will be able to create a userfaultfd.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MemBackend {
     /// FC reads the whole snapshot mem file synchronously before resuming.
@@ -61,13 +84,53 @@ impl std::str::FromStr for MemBackend {
     }
 }
 
-/// Parse `MICROVM_MEM_BACKEND`. Absent → the `File` default; an invalid
+/// Sysctl gating `userfaultfd(2)` for processes without CAP_SYS_PTRACE.
+const UNPRIVILEGED_USERFAULTFD_SYSCTL: &str = "/proc/sys/vm/unprivileged_userfaultfd";
+
+/// Whether *any* process on this host — including a jailed, privilege-
+/// dropped Firecracker — can create a userfaultfd.
+///
+/// The userfaultfd behind [`MemBackend::Uffd`] is created by the
+/// **Firecracker process** (it hands the fd to our handler over the UDS),
+/// so probing our own process (a `userfaultfd(2)` attempt here) would
+/// over-approximate: this process may hold CAP_SYS_PTRACE while the jailed
+/// FC it spawns runs uid-dropped and fails at restore time. The
+/// `vm.unprivileged_userfaultfd=1` sysctl is the one signal valid for
+/// every FC we spawn. Hosts running FC privileged with the sysctl off can
+/// still opt in explicitly via `MICROVM_MEM_BACKEND=uffd`.
+///
+/// Missing file (kernel without CONFIG_USERFAULTFD, non-Linux) reads as
+/// unsupported — fail-safe to the File backend.
+fn host_allows_unprivileged_uffd() -> bool {
+    fs::read_to_string(UNPRIVILEGED_USERFAULTFD_SYSCTL)
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Parse `MICROVM_MEM_BACKEND`. An explicit value always wins; an invalid
 /// value panics rather than silently running with the wrong backend — a
 /// misconfigured operator must find out at startup, not on the first slow
 /// restore.
-fn mem_backend_from_env_value(value: Option<&str>) -> MemBackend {
+///
+/// Absent → auto-detect from `uffd_usable` (the
+/// [`host_allows_unprivileged_uffd`] probe, injected for testability):
+/// `Uffd` when the host allows it — restores resume in ~ms instead of
+/// reading the whole guest-RAM file — else `File` with a one-line warning
+/// naming the sysctl that would unlock the fast path.
+fn mem_backend_from_env_value(value: Option<&str>, uffd_usable: bool) -> MemBackend {
     match value {
-        None => MemBackend::default(),
+        None if uffd_usable => MemBackend::Uffd,
+        None => {
+            eprintln!(
+                "[microvm-firecracker] MICROVM_MEM_BACKEND unset and \
+                 {UNPRIVILEGED_USERFAULTFD_SYSCTL} != 1: using the File memory \
+                 backend (snapshot restore reads the entire guest-RAM file \
+                 before resume). Set vm.unprivileged_userfaultfd=1 — or \
+                 MICROVM_MEM_BACKEND=uffd if firecracker runs with \
+                 CAP_SYS_PTRACE — for lazy userfaultfd restores."
+            );
+            MemBackend::File
+        }
         Some(v) => v
             .parse::<MemBackend>()
             .unwrap_or_else(|e| panic!("MICROVM_MEM_BACKEND: {e}")),
@@ -203,8 +266,9 @@ pub struct FirecrackerConfig {
     /// Max wait for Firecracker API socket readiness after process spawn.
     pub socket_ready_timeout: Duration,
     /// Guest-memory backend for snapshot restore. `MICROVM_MEM_BACKEND`
-    /// accepts `file` (default) or `uffd`; an invalid value fails loudly at
-    /// config load.
+    /// accepts `file` or `uffd`; unset, [`Self::from_env`] auto-detects
+    /// (`uffd` when the host permits unprivileged userfaultfd, else `file`
+    /// with a warning); an invalid value fails loudly at config load.
     pub mem_backend: MemBackend,
 }
 
@@ -255,8 +319,10 @@ impl FirecrackerConfig {
                 .filter(|v| *v > 0)
                 .unwrap_or(DEFAULT_SOCKET_READY_TIMEOUT_MS),
         );
-        let mem_backend =
-            mem_backend_from_env_value(std::env::var("MICROVM_MEM_BACKEND").ok().as_deref());
+        let mem_backend = mem_backend_from_env_value(
+            std::env::var("MICROVM_MEM_BACKEND").ok().as_deref(),
+            host_allows_unprivileged_uffd(),
+        );
 
         Self {
             binary_path,
@@ -378,6 +444,27 @@ fn move_into_place(from: &Path, to: &Path) -> VmRuntimeResult<()> {
             to.display()
         ))),
     }
+}
+
+/// Build the `PUT /machine-config` body.
+///
+/// `track_dirty_pages` defaults to **off**: it exists solely to feed diff
+/// snapshots, and this adapter only ever issues `snapshot_type: "Full"`
+/// creates and `enable_diff_snapshots: false` loads — so the kernel
+/// dirty-page bitmap would tax every guest write with no consumer. Set
+/// [`crate::model::VmSpec::track_dirty_pages`] to `Some(true)` per-VM when
+/// diff snapshots are driven externally.
+fn machine_config_body(
+    vcpu_count: u8,
+    mem_size_mib: u32,
+    track_dirty_pages: Option<bool>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "vcpu_count": vcpu_count,
+        "mem_size_mib": mem_size_mib,
+        "smt": false,
+        "track_dirty_pages": track_dirty_pages.unwrap_or(false)
+    })
 }
 
 /// Build the `PUT /snapshot/load` body. `mem_backend` is either the `File`
@@ -782,6 +869,7 @@ impl FirecrackerVmProvider {
 
     fn wait_for_socket_ready(&self, socket_path: &Path) -> VmRuntimeResult<()> {
         let deadline = Instant::now() + self.config.socket_ready_timeout;
+        let mut interval = SOCKET_POLL_INITIAL_INTERVAL;
         while Instant::now() < deadline {
             if socket_path.exists()
                 && self
@@ -790,7 +878,8 @@ impl FirecrackerVmProvider {
             {
                 return Ok(());
             }
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(interval);
+            interval = next_socket_poll_interval(interval);
         }
         Err(VmRuntimeError::Unsupported(format!(
             "firecracker api socket not ready within {:?}: {}",
@@ -823,13 +912,7 @@ impl FirecrackerVmProvider {
 
         let vcpu_count = spec.vcpu_count.unwrap_or(self.config.vcpu_count);
         let mem_size_mib = spec.mem_size_mib.unwrap_or(self.config.mem_size_mib);
-        let track_dirty_pages = spec.track_dirty_pages.unwrap_or(true);
-        let machine = serde_json::json!({
-            "vcpu_count": vcpu_count,
-            "mem_size_mib": mem_size_mib,
-            "smt": false,
-            "track_dirty_pages": track_dirty_pages
-        });
+        let machine = machine_config_body(vcpu_count, mem_size_mib, spec.track_dirty_pages);
         self.firecracker_request(socket_path, "PUT", "/machine-config", Some(machine))?;
 
         // A jailed FC resolves every path inside its chroot, where the jailer
@@ -1907,15 +1990,59 @@ mod tests {
     }
 
     #[test]
-    fn mem_backend_env_absent_defaults_to_file() {
-        assert_eq!(mem_backend_from_env_value(None), MemBackend::File);
-        assert_eq!(mem_backend_from_env_value(Some("uffd")), MemBackend::Uffd);
+    fn mem_backend_env_absent_resolves_from_uffd_probe() {
+        // Probe says the host allows unprivileged userfaultfd → lazy restore.
+        assert_eq!(mem_backend_from_env_value(None, true), MemBackend::Uffd);
+        // Probe says no → fail-safe to File (with a warning on stderr).
+        assert_eq!(mem_backend_from_env_value(None, false), MemBackend::File);
+    }
+
+    #[test]
+    fn mem_backend_env_explicit_value_beats_probe() {
+        // Operator forces uffd on a host the probe rejected (e.g. FC runs
+        // with CAP_SYS_PTRACE and the sysctl is off).
+        assert_eq!(
+            mem_backend_from_env_value(Some("uffd"), false),
+            MemBackend::Uffd
+        );
+        // Operator forces file even though the host could do uffd.
+        assert_eq!(
+            mem_backend_from_env_value(Some("file"), true),
+            MemBackend::File
+        );
+    }
+
+    #[test]
+    fn mem_backend_default_stays_file_for_programmatic_configs() {
+        // `Default` must not probe — a hand-built config keeps the
+        // always-works backend unless the caller opts in.
+        assert_eq!(MemBackend::default(), MemBackend::File);
     }
 
     #[test]
     #[should_panic(expected = "MICROVM_MEM_BACKEND")]
     fn mem_backend_env_invalid_value_fails_loud() {
-        mem_backend_from_env_value(Some("filee"));
+        mem_backend_from_env_value(Some("filee"), false);
+    }
+
+    // ---- Socket-ready poll backoff ----
+
+    #[test]
+    fn socket_poll_backoff_doubles_then_caps_at_old_flat_interval() {
+        let mut interval = SOCKET_POLL_INITIAL_INTERVAL;
+        let mut schedule = vec![interval];
+        for _ in 0..8 {
+            interval = next_socket_poll_interval(interval);
+            schedule.push(interval);
+        }
+        let ms: Vec<u64> = schedule.iter().map(|d| d.as_millis() as u64).collect();
+        // 2,4,8,16,32,64 then pinned at the 100 ms cap (the old flat poll).
+        assert_eq!(ms, vec![2, 4, 8, 16, 32, 64, 100, 100, 100]);
+        // The cap is sticky: once reached the interval never moves again.
+        assert_eq!(
+            next_socket_poll_interval(SOCKET_POLL_MAX_INTERVAL),
+            SOCKET_POLL_MAX_INTERVAL
+        );
     }
 
     // ---- Snapshot artifact path model ----
@@ -1970,6 +2097,31 @@ mod tests {
         move_into_place(&from, &to).unwrap();
         assert!(!from.exists());
         assert_eq!(fs::read(&to).unwrap(), b"pages");
+    }
+
+    // ---- /machine-config body ----
+
+    #[test]
+    fn machine_config_defaults_track_dirty_pages_off() {
+        // No consumer exists for the dirty bitmap (Full snapshots only), so
+        // the unset spec must not pay for it.
+        let body = machine_config_body(2, 512, None);
+        assert_eq!(body["vcpu_count"], 2);
+        assert_eq!(body["mem_size_mib"], 512);
+        assert_eq!(body["smt"], false);
+        assert_eq!(body["track_dirty_pages"], false);
+    }
+
+    #[test]
+    fn machine_config_track_dirty_pages_stays_settable() {
+        assert_eq!(
+            machine_config_body(1, 128, Some(true))["track_dirty_pages"],
+            true
+        );
+        assert_eq!(
+            machine_config_body(1, 128, Some(false))["track_dirty_pages"],
+            false
+        );
     }
 
     // ---- /snapshot/load body ----

@@ -57,9 +57,9 @@ const UFFD_SOCKET_BASENAME: &str = "uffd.sock";
 ///
 /// The `Default` impl is [`MemBackend::File`] — the always-works choice for
 /// programmatically constructed configs. [`FirecrackerConfig::from_env`]
-/// is smarter: with `MICROVM_MEM_BACKEND` unset it probes the host (see
-/// [`host_allows_unprivileged_uffd`]) and picks `Uffd` when the spawned
-/// Firecracker will be able to create a userfaultfd.
+/// is smarter: with `MICROVM_MEM_BACKEND` unset it probes
+/// `/proc/sys/vm/unprivileged_userfaultfd` and picks `Uffd` when the
+/// spawned Firecracker will be able to create a userfaultfd.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MemBackend {
     /// FC reads the whole snapshot mem file synchronously before resuming.

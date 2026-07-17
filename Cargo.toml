@@ -1,6 +1,6 @@
 [package]
 name = "microvm-runtime"
-version = "0.4.0-alpha.3"
+version = "0.4.0-alpha.4"
 edition = "2024"
 rust-version = "1.91"
 description = "Firecracker microVM driver for decentralized Tangle operators — pure-Rust primitive, no service, no auth, no business logic."

@@ -30,7 +30,7 @@ sha2 = { version = "0.11", default-features = false, optional = true }
 # onto the newline-delimited JSON wire format that talks to the in-guest
 # daemon. The crate is the de-facto pure-Rust base64 implementation; gated
 # on `firecracker` so the no-feature default build pulls nothing extra.
-base64 = { version = "0.22", default-features = false, features = ["std"], optional = true }
+base64 = { version = "0.23", default-features = false, features = ["std"], optional = true }
 
 # `libc` is only pulled in on Linux. Used by:
 # - `shutdown::graceful_shutdown` to call `kill(2)` with `SIGTERM` directly
@@ -57,7 +57,7 @@ tempfile = "3"
 # kernel's vsock interface directly.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 vsock = "0.5"
-base64 = { version = "0.22", default-features = false, features = ["std"] }
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 
 [features]
 default = []

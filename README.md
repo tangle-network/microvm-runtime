@@ -70,7 +70,7 @@ Merge `origin/main` before qualifying source changes. Run the affected integrati
 Use the toolchain selected by `rust-toolchain.toml`; provision it on the admitted host before running the source-owned commands.
 
 ```bash
-beelink-gate --no-install auto https://github.com/tangle-network/microvm-runtime.git <full-sha> -- bash -lc 'export RUSTFLAGS="-D warnings"; cargo fmt --all -- --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --all-features && cargo test --no-default-features && RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps'
+beelink-gate auto https://github.com/tangle-network/microvm-runtime.git <full-sha> -- bash -lc 'export RUSTFLAGS="-D warnings"; cargo fmt --all -- --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --all-features && cargo test --no-default-features && RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps'
 ```
 
 Automatic PR/push CI is retired. A source check does not prove a running VM. Real Firecracker, networking, snapshot or lifecycle checks require the existing disposable hostlab execution path and its kernel, image and KVM prerequisites; use that path for affected behavior and retain its receipts. This command does not authorize host or VM changes.

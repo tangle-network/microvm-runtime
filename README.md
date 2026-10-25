@@ -63,6 +63,18 @@ provider.destroy_vm("vm-1")?;
 | `MICROVM_FIRECRACKER_MEM_MIB` | `256` | Default memory size |
 | `MICROVM_MEM_BACKEND` | auto | Snapshot-restore memory backend: `file` (FC reads the whole mem file before resume) or `uffd` (userfaultfd handler pages memory in on demand). Unset, the config probes `/proc/sys/vm/unprivileged_userfaultfd`: `1` → `uffd`, else `file` with a warning. Set `uffd` explicitly if Firecracker runs with CAP_SYS_PTRACE on a host with the sysctl off. |
 
+## Local qualification
+
+Merge `origin/main` before qualifying source changes. Run the affected integration surface before merge through the admitted launcher. The comprehensive reference below retains the former branch checks; workflow and documentation-only changes use YAML, content, link and diff checks.
+
+Use the toolchain selected by `rust-toolchain.toml`; provision it on the admitted host before running the source-owned commands.
+
+```bash
+beelink-gate --no-install auto https://github.com/tangle-network/microvm-runtime.git <full-sha> -- bash -lc 'export RUSTFLAGS="-D warnings"; cargo fmt --all -- --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --all-features && cargo test --no-default-features && RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps'
+```
+
+Automatic PR/push CI is retired. A source check does not prove a running VM. Real Firecracker, networking, snapshot or lifecycle checks require the existing disposable hostlab execution path and its kernel, image and KVM prerequisites; use that path for affected behavior and retain its receipts. This command does not authorize host or VM changes.
+
 ## License
 
 [Unlicense](LICENSE) — public domain.
